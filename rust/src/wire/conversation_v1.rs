@@ -4,6 +4,7 @@
 //! `vektori/vektori-razgovora.json`; conversation session logic is kept out until
 //! the general ledger abstraction is designed.
 
+use crate::wire::go_json::to_go_json_vec;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::{collections::BTreeMap, fmt};
@@ -281,8 +282,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let mut bytes =
-        serde_json::to_vec(msg).map_err(|e| ConversationV1Error::Json(e.to_string()))?;
+    let mut bytes = to_go_json_vec(msg).map_err(|e| ConversationV1Error::Json(e.to_string()))?;
     bytes.push(b'\n');
     if bytes.len() > max_bytes {
         return Err(ConversationV1Error::TooLarge { limit: max_bytes });
@@ -300,9 +300,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::go_json::to_go_json_string;
 
     fn to_line<T: Serialize>(v: &T) -> String {
-        let mut s = serde_json::to_string(v).unwrap();
+        let mut s = to_go_json_string(v).unwrap();
         s.push('\n');
         s
     }
@@ -453,12 +454,43 @@ mod tests {
         assert_eq!(ver.payload.get(), r#"{"id":"biljeska-1"}"#);
         assert_eq!(serde_json::to_string(&ver).unwrap(), ver_str);
 
-        // odbijenica (no payload)
-        let odb_line = z["odbijenica"].as_str().unwrap();
-        let odb_env: EnvelopeV1 = serde_json::from_str(odb_line.trim_end()).unwrap();
-        assert_eq!(odb_env.kind, KIND_V1_ODBIJENO);
-        assert!(odb_env.payload.is_none());
-        assert_eq!(to_line(&odb_env), odb_line);
+        // odbijenica (no payload) & posebniZnakovi.odbijenica (`<`, `>`, `&` escaped like Go)
+        for odb_line in [
+            z["odbijenica"].as_str().unwrap(),
+            z["posebniZnakovi"]["odbijenica"].as_str().unwrap(),
+        ] {
+            let odb_env: EnvelopeV1 = serde_json::from_str(odb_line.trim_end()).unwrap();
+            assert_eq!(odb_env.kind, KIND_V1_ODBIJENO);
+            assert!(odb_env.payload.is_none());
+            assert_eq!(to_line(&odb_env), odb_line);
+        }
+
+        // deltaSPosebnimZnakovima built from literal sadrzajSPosebnimZnakovima
+        let raw_payload =
+            RawValue::from_string(v["sadrzajSPosebnimZnakovima"].as_str().unwrap().to_owned())
+                .unwrap();
+        let ver_special = VersionV1 {
+            version_id: "0199c82c-0000-7000-8000-000000000003".into(),
+            entity: "biljeske".into(),
+            entity_id: "biljeska-2".into(),
+            node_id: "admin-1".into(),
+            supersedes: String::new(),
+            archived: false,
+            payload: raw_payload,
+            created_at: "2025-10-09T08:53:22Z".into(),
+            schema_version: 1,
+            channel: None,
+        };
+        let delta_special = DeltaPayload {
+            versions: vec![ver_special],
+            ..Default::default()
+        };
+        let env_special =
+            EnvelopeV1::with_payload(KIND_V1_DELTA, "admin-1", &delta_special).unwrap();
+        assert_eq!(
+            to_line(&env_special),
+            v["deltaSPosebnimZnakovima"].as_str().unwrap()
+        );
     }
 
     #[tokio::test]

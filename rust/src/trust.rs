@@ -1,4 +1,5 @@
 use crate::identity::{parse_public_key, public_key_to_base64};
+use crate::wire::go_json::to_go_json_vec;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -177,7 +178,7 @@ impl Ovlast {
             issued_at: i64,
             expires_at: i64,
         }
-        serde_json::to_vec(&Canonical {
+        to_go_json_vec(&Canonical {
             v: OVLAST_CANONICAL_VERSION,
             network: &self.network,
             device_id: &self.device_id,
@@ -240,7 +241,7 @@ impl Membership {
                 expires_at: i64,
                 ovlast: &'a str,
             }
-            serde_json::to_vec(&CanonicalV2 {
+            to_go_json_vec(&CanonicalV2 {
                 v: 2,
                 network: &self.network,
                 device_id: &self.device_id,
@@ -263,7 +264,7 @@ impl Membership {
                 issued_at: i64,
                 expires_at: i64,
             }
-            serde_json::to_vec(&CanonicalV1 {
+            to_go_json_vec(&CanonicalV1 {
                 v: 1,
                 network: &self.network,
                 device_id: &self.device_id,
@@ -386,7 +387,7 @@ impl Revocation {
             opozvao: &'a str,
             potpisnik: &'a str,
         }
-        serde_json::to_vec(&Canonical {
+        to_go_json_vec(&Canonical {
             v: REVOCATION_CANONICAL_VERSION,
             vrsta: &self.kind,
             node_id: &self.target_id,
@@ -1018,5 +1019,71 @@ mod tests {
             v["opoziv"]["zapis"].as_str().unwrap()
         );
         assert_eq!(rev.verify_self().unwrap(), net.public);
+    }
+
+    #[test]
+    fn gocop_special_chars_vectors_match_byte_for_byte() {
+        use crate::wire::go_json::to_go_json_string;
+
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../vektori/vektori-zice.json"))
+                .expect("vektori-zice.json");
+        let ulaz = &v["ulaz"];
+        let pz = &v["posebniZnakovi"];
+        let ime = pz["ime"].as_str().unwrap();
+        let now = ulaz["vrijeme"].as_i64().unwrap();
+
+        let seed_a: [u8; 32] = hex::decode(ulaz["sjemeA"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let seed_net: [u8; 32] = hex::decode(ulaz["sjemeMreze"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sk_a = SigningKey::from_bytes(&seed_a);
+        let sk_net = SigningKey::from_bytes(&seed_net);
+        let net = NetworkKey::from_signing_key("test", sk_net);
+
+        let ovlast = net
+            .issue_ovlast(ime, &sk_a.verifying_key(), ime, now, 3600)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(ovlast.signed_bytes()).unwrap(),
+            pz["ovlast"]["bajtovi"].as_str().unwrap()
+        );
+        assert_eq!(ovlast.signature, pz["ovlast"]["potpis"].as_str().unwrap());
+        assert_eq!(
+            to_go_json_string(&ovlast).unwrap(),
+            pz["ovlast"]["zapis"].as_str().unwrap()
+        );
+        ovlast.verify(&net.public, now).unwrap();
+
+        let clanstvo = net
+            .admit_member(
+                ime,
+                &sk_a.verifying_key(),
+                ime,
+                Validity {
+                    issued_at: now,
+                    valid_for_secs: 3600,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(clanstvo.signed_bytes()).unwrap(),
+            pz["clanstvo"]["bajtovi"].as_str().unwrap()
+        );
+        assert_eq!(
+            clanstvo.signature,
+            pz["clanstvo"]["potpis"].as_str().unwrap()
+        );
+        assert_eq!(
+            to_go_json_string(&clanstvo).unwrap(),
+            pz["clanstvo"]["zapis"].as_str().unwrap()
+        );
+        clanstvo
+            .verify(&net.public, &sk_a.verifying_key(), now)
+            .unwrap();
     }
 }
