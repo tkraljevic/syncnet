@@ -1,24 +1,23 @@
 # syncnet u Rustu
 
-Izvedba u Rustu: ključevi i certifikati, uparivanje uz kod, TLS, članstvo
-i ovlasti, pronalaženje u lokalnoj mreži, STUN, probijanje, signal, okvir
-poruke, razgovor i potpisani paket.
-
-Premještena je ovamo iz programa List2Cart, koji je i dalje koristi.
+Opća biblioteka u Rustu: Ed25519 identitet i TLS 1.3 certifikati, SAS uparivanje,
+ovlasti/članstvo/opozivi usklađeni s goCOP-ovim vektorima žice, pronalaženje u
+lokalnoj mreži, STUN, UDP probijanje, signal, okvir poruke, kodek inačice 1
+razgovora i potpisani paket `bundle_v2`.
 
 ```sh
 cargo test
 ```
 
-## Što još nije opće
+## Što još ostaje za dovršiti
 
-Kod je pisan za jednu aplikaciju i to se još vidi:
-
-- oznaka vjerodajnica i ALPN-i nose ime te aplikacije kao stalne
-  konstante, iako se ime protokola inače zadaje;
-- potpis verzije i potpis paketa imaju prefiks s njezinim imenom;
-- model dijeljenja (`ListGrant`, uloge članova) je njezin;
-- zadani port pronalaženja i zadano ime uređaja su njezini.
-
-Razgovor ima vlastite poruke i ne odgovara onome u
-[opisu protokola](../docs/PROTOKOL.md).
+- oznaku vjerodajnica mora moći zadati aplikacija neovisno o imenu protokola
+  (goCOP je drži stalnom i uz drugo ime protokola);
+- zadani port pronalaženja ne smije biti vezan uz jednu aplikaciju;
+- korisničke rečenice u greškama treba u potpunosti svesti na kodove kako bi
+  tekstove pisala aplikacija;
+- testne vektore čitati iz zajedničke mape `vektori/` umjesto vlastite kopije
+  (`testdata/go-vectors.json`);
+- logika razgovora inačice 1 i opća knjiga dolaze u sljedećoj fazi (trenutno su
+  u biblioteci kodek i tipovi poruka inačice 1, a prijedlog inačice 2 opisan je
+  u [docs/PROTOKOL-V2.md](../docs/PROTOKOL-V2.md)).

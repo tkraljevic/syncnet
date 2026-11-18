@@ -33,8 +33,16 @@ use tokio_rustls::{
     server::TlsStream as ServerTlsStream,
 };
 
+pub fn alpn_for_version(protocol: &str, role: &str, version: u8) -> Vec<u8> {
+    format!("{protocol}-{role}/{version}").into_bytes()
+}
+
 pub fn alpn_for(protocol: &str, role: &str) -> Vec<u8> {
-    format!("{protocol}-{role}/1").into_bytes()
+    alpn_for_version(protocol, role, 1)
+}
+
+pub fn alpn_exchange_v2(protocol: &str) -> Vec<u8> {
+    alpn_for_version(protocol, "razmjena", 2)
 }
 
 pub fn alpn_pair(protocol: &str) -> Vec<u8> {
@@ -294,7 +302,7 @@ impl PeerVerifyState {
         self.tls13_sig_verified.store(true, Ordering::Release);
     }
 
-    fn take_verified(
+    pub(crate) fn take_verified(
         &self,
         handshake_err: Option<String>,
     ) -> Result<VerifiedPeerCert, TlsAuthError> {
@@ -490,12 +498,19 @@ impl ClientCertVerifier for Ed25519PeerVerifier {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationVersion {
+    V1,
+    V2,
+}
+
 #[derive(Debug)]
 pub struct AuthenticatedStream<S> {
     pub stream: S,
     pub peer_key: [u8; 32],
     pub peer_credentials: Option<Vec<u8>>,
     pub rtt: Duration,
+    pub protocol_version: ConversationVersion,
 }
 
 pub fn build_server_config_with_resolver(
@@ -518,7 +533,9 @@ pub fn build_server_config_with_resolver(
         .map_err(|e| TlsAuthError::Tls(e.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(resolver);
-    cfg.alpn_protocols = vec![alpn.to_vec()];
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+    }
     Ok((Arc::new(cfg), state))
 }
 
@@ -543,7 +560,9 @@ pub fn build_client_config_with_resolver(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(resolver);
-    cfg.alpn_protocols = vec![alpn.to_vec()];
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+    }
     Ok((Arc::new(cfg), state))
 }
 
@@ -596,6 +615,17 @@ where
     }
 }
 
+fn resolve_exchange_version(
+    negotiated: Option<&[u8]>,
+    alpn_v2: &[u8],
+) -> Result<ConversationVersion, TlsAuthError> {
+    match negotiated {
+        None => Ok(ConversationVersion::V1),
+        Some(p) if p == alpn_v2 => Ok(ConversationVersion::V2),
+        Some(_) => Err(TlsAuthError::NotAPeer("unexpected ALPN".to_owned())),
+    }
+}
+
 pub async fn dial_exchange_on<S>(
     stream: S,
     sk: &SigningKey,
@@ -608,7 +638,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, credentials_fn)?;
-    let alpn = alpn_lan(protocol);
+    let alpn = alpn_exchange_v2(protocol);
     let (cfg, state) = build_client_config_with_resolver(
         resolver,
         protocol,
@@ -622,11 +652,14 @@ where
         Ok(tls_stream) => {
             let rtt = start.elapsed();
             let verified = state.take_verified(None)?;
+            let protocol_version =
+                resolve_exchange_version(tls_stream.get_ref().1.alpn_protocol(), &alpn)?;
             Ok(AuthenticatedStream {
                 stream: tls_stream,
                 peer_key: verified.public_key,
                 peer_credentials: verified.credentials,
                 rtt,
+                protocol_version,
             })
         }
         Err(e) => Err(state.take_verified(Some(e.to_string())).unwrap_err()),
@@ -645,18 +678,21 @@ where
     F: Fn(&[u8; 32], Option<&[u8]>) -> bool + Send + Sync + 'static,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, credentials_fn)?;
-    let alpn = alpn_lan(protocol);
+    let alpn = alpn_exchange_v2(protocol);
     let (cfg, state) =
         build_server_config_with_resolver(resolver, protocol, &alpn, Some(Arc::new(trusted)))?;
     let acceptor = TlsAcceptor::from(cfg);
     match acceptor.accept(stream).await {
         Ok(tls_stream) => {
             let verified = state.take_verified(None)?;
+            let protocol_version =
+                resolve_exchange_version(tls_stream.get_ref().1.alpn_protocol(), &alpn)?;
             Ok(AuthenticatedStream {
                 stream: tls_stream,
                 peer_key: verified.public_key,
                 peer_credentials: verified.credentials,
                 rtt: Duration::ZERO,
+                protocol_version,
             })
         }
         Err(e) => Err(state.take_verified(Some(e.to_string())).unwrap_err()),
@@ -691,7 +727,7 @@ where
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(Arc::new(NoClientCertResolver));
-    cfg.alpn_protocols = vec![alpn_lan(protocol)];
+    cfg.alpn_protocols = vec![alpn_exchange_v2(protocol)];
 
     let connector = TlsConnector::from(Arc::new(cfg));
     let server_name = sni_for_protocol(protocol)?;
@@ -802,7 +838,7 @@ mod tests {
             .unwrap()
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(FixedCertResolver(mismatched_certified)));
-        fake_server_cfg.alpn_protocols = vec![alpn_lan("list2cart")];
+        fake_server_cfg.alpn_protocols = vec![alpn_exchange_v2("list2cart")];
         let acceptor = TlsAcceptor::from(Arc::new(fake_server_cfg));
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
@@ -952,5 +988,83 @@ mod tests {
         let pair_on_exchange = handshake_pairing_client(c_io3, &paired_key, "list2cart").await;
         assert!(pair_on_exchange.is_err());
         assert!(srv3.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_accepts_client_without_alpn_as_v1_and_negotiates_v2_when_offered() {
+        let server_key = generate_signing_key();
+        let client_key = generate_signing_key();
+        let server_pub = server_key.verifying_key().to_bytes();
+        let client_pub = client_key.verifying_key().to_bytes();
+
+        // 1. Both sides use `accept_exchange_on` / `dial_exchange_on` -> negotiates V2.
+        let (c1, s1) = tokio::io::duplex(16 * 1024);
+        let sk_s1 = server_key.clone();
+        let srv1 = tokio::spawn(async move {
+            accept_exchange_on(s1, &sk_s1, "gocop", None, |_, _| true).await
+        });
+        let cli1 = dial_exchange_on(
+            c1,
+            &client_key,
+            "gocop",
+            None,
+            "127.0.0.1:4710",
+            &server_pub,
+        )
+        .await
+        .expect("v2 dial");
+        let srv1_res = srv1.await.unwrap().expect("v2 accept");
+        assert_eq!(cli1.protocol_version, ConversationVersion::V2);
+        assert_eq!(srv1_res.protocol_version, ConversationVersion::V2);
+
+        // 2. Rust server (advertising `gocop-razmjena/2`) accepts a client that sends NO ALPN -> V1.
+        let (c2, s2) = tokio::io::duplex(16 * 1024);
+        let sk_s2 = server_key.clone();
+        let srv2 = tokio::spawn(async move {
+            accept_exchange_on(s2, &sk_s2, "gocop", None, |_, _| true).await
+        });
+        let resolver_c2 = DynamicCertResolver::new(client_key.clone(), "gocop", None).unwrap();
+        let (cfg_c2, state_c2) = build_client_config_with_resolver(
+            resolver_c2,
+            "gocop",
+            b"",
+            Some((server_pub, "127.0.0.1:4710".to_owned())),
+        )
+        .unwrap();
+        let conn_c2 = TlsConnector::from(cfg_c2)
+            .connect(sni_for_protocol("gocop").unwrap(), c2)
+            .await
+            .expect("client without ALPN connects");
+        state_c2.take_verified(None).unwrap();
+        assert_eq!(conn_c2.get_ref().1.alpn_protocol(), None);
+        let srv2_res = srv2.await.unwrap().expect("server accepts no-ALPN client");
+        assert_eq!(srv2_res.protocol_version, ConversationVersion::V1);
+
+        // 3. Rust client (offering `gocop-razmjena/2`) connects to a server with NO ALPN -> V1.
+        let (c3, s3) = tokio::io::duplex(16 * 1024);
+        let resolver_s3 = DynamicCertResolver::new(server_key.clone(), "gocop", None).unwrap();
+        let (cfg_s3, state_s3) =
+            build_server_config_with_resolver(resolver_s3, "gocop", b"", None).unwrap();
+        let srv3 = tokio::spawn(async move {
+            let stream = TlsAcceptor::from(cfg_s3)
+                .accept(s3)
+                .await
+                .expect("server without ALPN accepts");
+            let verified = state_s3.take_verified(None).unwrap();
+            assert_eq!(verified.public_key, client_pub);
+            assert_eq!(stream.get_ref().1.alpn_protocol(), None);
+        });
+        let cli3 = dial_exchange_on(
+            c3,
+            &client_key,
+            "gocop",
+            None,
+            "127.0.0.1:4710",
+            &server_pub,
+        )
+        .await
+        .expect("client falls back to V1 when server sends no ALPN");
+        assert_eq!(cli3.protocol_version, ConversationVersion::V1);
+        srv3.await.unwrap();
     }
 }

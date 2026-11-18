@@ -1,7 +1,10 @@
 use crate::{
     identity::public_key_to_base64,
     tls::{TlsAuthError, handshake_pairing_client, handshake_pairing_server},
-    wire::frame::{FrameError, read_frame_async, write_frame_async},
+    wire::{
+        conversation_v1::{ConversationV1Error, read_line_bytes},
+        frame::{FrameError, read_frame_async, write_frame_async},
+    },
 };
 use ed25519_dalek::SigningKey;
 use rand::{RngCore, rngs::OsRng};
@@ -226,6 +229,71 @@ impl From<FrameError> for PairingError {
     }
 }
 
+async fn write_pairing_msg<S>(
+    stream: &mut S,
+    bytes: &[u8],
+    max_len: usize,
+    line_json: bool,
+) -> Result<(), PairingError>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !line_json {
+        write_frame_async(stream, bytes, max_len).await?;
+        return Ok(());
+    }
+    if bytes.len() + 1 > max_len {
+        return Err(PairingError::Frame(FrameError::TooLarge {
+            len: bytes.len() + 1,
+            max: max_len,
+        }));
+    }
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|e| PairingError::Io(e.to_string()))?;
+    stream
+        .write_all(b"\n")
+        .await
+        .map_err(|e| PairingError::Io(e.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| PairingError::Io(e.to_string()))
+}
+
+async fn read_pairing_msg<S>(
+    stream: &mut S,
+    max_len: usize,
+    line_json: bool,
+) -> Result<Vec<u8>, PairingError>
+where
+    S: AsyncRead + Unpin,
+{
+    if !line_json {
+        return match read_frame_async(stream, max_len).await {
+            Ok(bytes) => Ok(bytes),
+            Err(FrameError::Io(msg))
+                if msg.contains("early eof") || msg.contains("unexpected end of file") =>
+            {
+                Err(PairingError::PeerNotWaitingToPair)
+            }
+            Err(e) => Err(PairingError::Frame(e)),
+        };
+    }
+    match read_line_bytes(stream, max_len).await {
+        Ok(bytes) => Ok(bytes),
+        Err(ConversationV1Error::UnexpectedEof) => Err(PairingError::PeerNotWaitingToPair),
+        Err(ConversationV1Error::TooLarge { limit }) => {
+            Err(PairingError::Frame(FrameError::TooLarge {
+                len: limit,
+                max: limit,
+            }))
+        }
+        Err(e) => Err(PairingError::Io(e.to_string())),
+    }
+}
+
 pub async fn exchange_hello_async<S>(
     stream: &mut S,
     identity: &PairIdentity,
@@ -233,23 +301,26 @@ pub async fn exchange_hello_async<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    exchange_hello_mode(stream, identity, false).await
+}
+
+async fn exchange_hello_mode<S>(
+    stream: &mut S,
+    identity: &PairIdentity,
+    line_json: bool,
+) -> Result<PairHello, PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let our_hello = identity.to_hello();
     let encoded =
         serde_json::to_vec(&our_hello).map_err(|e| PairingError::Serialization(e.to_string()))?;
-    write_frame_async(stream, &encoded, MAX_HELLO_LEN).await?;
+    write_pairing_msg(stream, &encoded, MAX_HELLO_LEN, line_json).await?;
 
-    let raw = match read_frame_async(stream, MAX_HELLO_LEN).await {
-        Ok(bytes) => bytes,
-        Err(FrameError::Io(msg))
-            if msg.contains("early eof") || msg.contains("unexpected end of file") =>
-        {
-            return Err(PairingError::PeerNotWaitingToPair);
-        }
-        Err(e) => return Err(PairingError::Frame(e)),
-    };
+    let raw = read_pairing_msg(stream, MAX_HELLO_LEN, line_json).await?;
 
     let peer: PairHello = serde_json::from_slice(&raw)
-        .map_err(|e| PairingError::Serialization(format!("citanje pozdrava druge strane: {e}")))?;
+        .map_err(|e| PairingError::Serialization(format!("peer hello parse error: {e}")))?;
     if peer.protocol != identity.protocol {
         return Err(PairingError::WrongProtocol {
             peer: peer.protocol,
@@ -270,6 +341,18 @@ pub async fn negotiate_sas_caller_async<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    negotiate_sas_caller_mode(stream, protocol, caller_nonce, false).await
+}
+
+async fn negotiate_sas_caller_mode<S>(
+    stream: &mut S,
+    protocol: &str,
+    caller_nonce: &[u8; SAS_NONCE_LEN],
+    line_json: bool,
+) -> Result<[u8; SAS_NONCE_LEN], PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let commit = compute_sas_commit(protocol, caller_nonce);
     let step1 = SasWireMessage {
         obveza: Some(commit.to_vec()),
@@ -277,9 +360,9 @@ where
     };
     let step1_bytes =
         serde_json::to_vec(&step1).map_err(|e| PairingError::Serialization(e.to_string()))?;
-    write_frame_async(stream, &step1_bytes, MAX_SAS_MSG_LEN).await?;
+    write_pairing_msg(stream, &step1_bytes, MAX_SAS_MSG_LEN, line_json).await?;
 
-    let reply_raw = read_frame_async(stream, MAX_SAS_MSG_LEN).await?;
+    let reply_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
     let reply: SasWireMessage = serde_json::from_slice(&reply_raw)
         .map_err(|e| PairingError::Serialization(e.to_string()))?;
     let Some(listener_vec) = reply.broj else {
@@ -298,7 +381,7 @@ where
     };
     let step3_bytes =
         serde_json::to_vec(&step3).map_err(|e| PairingError::Serialization(e.to_string()))?;
-    write_frame_async(stream, &step3_bytes, MAX_SAS_MSG_LEN).await?;
+    write_pairing_msg(stream, &step3_bytes, MAX_SAS_MSG_LEN, line_json).await?;
 
     Ok(listener_nonce)
 }
@@ -311,7 +394,19 @@ pub async fn negotiate_sas_listener_async<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let commit_raw = read_frame_async(stream, MAX_SAS_MSG_LEN).await?;
+    negotiate_sas_listener_mode(stream, protocol, listener_nonce, false).await
+}
+
+async fn negotiate_sas_listener_mode<S>(
+    stream: &mut S,
+    protocol: &str,
+    listener_nonce: &[u8; SAS_NONCE_LEN],
+    line_json: bool,
+) -> Result<[u8; SAS_NONCE_LEN], PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let commit_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
     let commit_msg: SasWireMessage = serde_json::from_slice(&commit_raw)
         .map_err(|e| PairingError::Serialization(e.to_string()))?;
     let Some(commit_vec) = commit_msg.obveza else {
@@ -327,9 +422,9 @@ where
     };
     let step2_bytes =
         serde_json::to_vec(&step2).map_err(|e| PairingError::Serialization(e.to_string()))?;
-    write_frame_async(stream, &step2_bytes, MAX_SAS_MSG_LEN).await?;
+    write_pairing_msg(stream, &step2_bytes, MAX_SAS_MSG_LEN, line_json).await?;
 
-    let reveal_raw = read_frame_async(stream, MAX_SAS_MSG_LEN).await?;
+    let reveal_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
     let reveal_msg: SasWireMessage = serde_json::from_slice(&reveal_raw)
         .map_err(|e| PairingError::Serialization(e.to_string()))?;
     let Some(caller_vec) = reveal_msg.broj else {
@@ -354,6 +449,7 @@ pub struct PendingPairing<S> {
     peer_host: Option<String>,
     sas: String,
     is_caller: bool,
+    line_json: bool,
 }
 
 impl<S> fmt::Debug for PendingPairing<S> {
@@ -422,8 +518,14 @@ where
             serde_json::to_vec(&mine).map_err(|e| PairingError::Serialization(e.to_string()))?;
 
         let outcome = timeout(CONFIRM_TIMEOUT, async {
-            write_frame_async(&mut self.stream, &mine_bytes, MAX_CONFIRM_LEN).await?;
-            let theirs_raw = read_frame_async(&mut self.stream, MAX_CONFIRM_LEN)
+            write_pairing_msg(
+                &mut self.stream,
+                &mine_bytes,
+                MAX_CONFIRM_LEN,
+                self.line_json,
+            )
+            .await?;
+            let theirs_raw = read_pairing_msg(&mut self.stream, MAX_CONFIRM_LEN, self.line_json)
                 .await
                 .map_err(|e| PairingError::PeerDisconnectedBeforeConfirm(e.to_string()))?;
             let theirs: PairConfirm = serde_json::from_slice(&theirs_raw)
@@ -457,6 +559,7 @@ async fn complete_pairing_handshake<S>(
     peer_host: Option<String>,
     identity: &PairIdentity,
     is_caller: bool,
+    line_json: bool,
 ) -> Result<PendingPairing<S>, PairingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -469,14 +572,24 @@ where
     OsRng.fill_bytes(&mut our_nonce);
 
     let res = timeout(HANDSHAKE_TIMEOUT, async {
-        let peer_hello = exchange_hello_async(&mut tls_stream, identity).await?;
+        let peer_hello = exchange_hello_mode(&mut tls_stream, identity, line_json).await?;
         let (caller_nonce, listener_nonce) = if is_caller {
-            let ln =
-                negotiate_sas_caller_async(&mut tls_stream, &identity.protocol, &our_nonce).await?;
+            let ln = negotiate_sas_caller_mode(
+                &mut tls_stream,
+                &identity.protocol,
+                &our_nonce,
+                line_json,
+            )
+            .await?;
             (our_nonce, ln)
         } else {
-            let cn = negotiate_sas_listener_async(&mut tls_stream, &identity.protocol, &our_nonce)
-                .await?;
+            let cn = negotiate_sas_listener_mode(
+                &mut tls_stream,
+                &identity.protocol,
+                &our_nonce,
+                line_json,
+            )
+            .await?;
             (cn, our_nonce)
         };
         let sas = compute_sas_code(
@@ -498,6 +611,7 @@ where
             peer_host,
             sas,
             is_caller,
+            line_json,
         }),
         Ok(Err(e)) => {
             let _ = tls_stream.shutdown().await;
@@ -505,9 +619,7 @@ where
         }
         Err(_) => {
             let _ = tls_stream.shutdown().await;
-            Err(PairingError::Io(
-                "istekao rok rukovanja uparivanja".to_owned(),
-            ))
+            Err(PairingError::Io("pairing handshake timed out".to_owned()))
         }
     }
 }
@@ -526,8 +638,9 @@ where
         handshake_pairing_client(stream, sk, &identity.protocol),
     )
     .await
-    .map_err(|_| PairingError::NotAPeer("istekao rok TLS rukovanja".to_owned()))??;
+    .map_err(|_| PairingError::NotAPeer("TLS handshake timed out".to_owned()))??;
 
+    let line_json = tls_stream.get_ref().1.alpn_protocol().is_none();
     complete_pairing_handshake(
         tls_stream,
         sk.verifying_key().to_bytes(),
@@ -535,6 +648,7 @@ where
         peer_host,
         identity,
         true,
+        line_json,
     )
     .await
 }
@@ -553,8 +667,9 @@ where
         handshake_pairing_server(stream, sk, &identity.protocol),
     )
     .await
-    .map_err(|_| PairingError::NotAPeer("istekao rok TLS rukovanja".to_owned()))??;
+    .map_err(|_| PairingError::NotAPeer("TLS handshake timed out".to_owned()))??;
 
+    let line_json = tls_stream.get_ref().1.alpn_protocol().is_none();
     complete_pairing_handshake(
         tls_stream,
         sk.verifying_key().to_bytes(),
@@ -562,6 +677,7 @@ where
         peer_host,
         identity,
         false,
+        line_json,
     )
     .await
 }
@@ -1087,5 +1203,104 @@ mod tests {
             negotiate_sas_listener_async(&mut s4, "list2cart", &listener_nonce).await,
             Err(PairingError::InvalidCommit)
         ));
+    }
+
+    #[test]
+    fn pairing_wire_vectors_match_byte_for_byte() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../vektori/vektori-zice.json"))
+                .expect("vektori-zice.json");
+        let up = &v["uparivanje"];
+
+        let hello_json = up["hello"].as_str().unwrap();
+        let hello: PairHello = serde_json::from_str(hello_json).unwrap();
+        assert_eq!(serde_json::to_string(&hello).unwrap(), hello_json);
+
+        let obveza_json = up["porukaObveze"].as_str().unwrap();
+        let obveza_msg: SasWireMessage = serde_json::from_str(obveza_json).unwrap();
+        assert_eq!(serde_json::to_string(&obveza_msg).unwrap(), obveza_json);
+
+        let broj_json = up["porukaBroja"].as_str().unwrap();
+        let broj_msg: SasWireMessage = serde_json::from_str(broj_json).unwrap();
+        assert_eq!(serde_json::to_string(&broj_msg).unwrap(), broj_json);
+
+        let potvrda_json = up["potvrda"].as_str().unwrap();
+        let potvrda_msg: PairConfirm = serde_json::from_str(potvrda_json).unwrap();
+        assert_eq!(serde_json::to_string(&potvrda_msg).unwrap(), potvrda_json);
+    }
+
+    #[tokio::test]
+    async fn pairing_accepts_client_without_alpn_over_line_json() {
+        use crate::identity::{cert_cn_for_protocol, generate_signing_key};
+        use crate::tls::{DynamicCertResolver, build_client_config_with_resolver};
+        use rustls::pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let sk_srv = generate_signing_key();
+        let sk_cli = generate_signing_key();
+        let id_srv = PairIdentity {
+            protocol: "gocop".to_owned(),
+            device_id: "srv".to_owned(),
+            name: "Posluzitelj".to_owned(),
+            version: "1.0.0".to_owned(),
+            meta: BTreeMap::new(),
+        };
+        let id_cli = PairIdentity {
+            protocol: "gocop".to_owned(),
+            device_id: "cli".to_owned(),
+            name: "Klijent".to_owned(),
+            version: "1.0.0".to_owned(),
+            meta: BTreeMap::new(),
+        };
+
+        let (c_io, s_io) = tokio::io::duplex(16 * 1024);
+        let sk_s = sk_srv.clone();
+        let id_s = id_srv.clone();
+        let srv = tokio::spawn(async move {
+            let pending = accept_pairing_on(s_io, None, &sk_s, &id_s)
+                .await
+                .expect("accept without ALPN");
+            assert!(pending.line_json);
+            let sas = pending.sas().to_owned();
+            let res = pending
+                .finish(true, Some(&serde_json::json!({"ok": 1})))
+                .await
+                .expect("srv finish");
+            (sas, res)
+        });
+
+        let resolver = DynamicCertResolver::new(sk_cli.clone(), "gocop", None).unwrap();
+        let (cfg, state) = build_client_config_with_resolver(resolver, "gocop", b"", None).unwrap();
+        let sni = ServerName::try_from(cert_cn_for_protocol("gocop")).unwrap();
+        let tls_cli = TlsConnector::from(cfg)
+            .connect(sni, c_io)
+            .await
+            .expect("connect without ALPN");
+        let verified = state.take_verified(None).unwrap();
+        assert_eq!(tls_cli.get_ref().1.alpn_protocol(), None);
+
+        let pending_cli = complete_pairing_handshake(
+            tls_cli,
+            sk_cli.verifying_key().to_bytes(),
+            verified.public_key,
+            None,
+            &id_cli,
+            true,
+            true,
+        )
+        .await
+        .expect("cli handshake");
+        let cli_sas = pending_cli.sas().to_owned();
+        let cli_res = pending_cli
+            .finish(true, Some(&serde_json::json!({"ok": 2})))
+            .await
+            .expect("cli finish");
+
+        let (srv_sas, srv_res) = srv.await.unwrap();
+        assert_eq!(cli_sas, srv_sas);
+        assert!(cli_res.approved);
+        assert!(srv_res.approved);
+        assert_eq!(srv_res.payload, Some(serde_json::json!({"ok": 2})));
+        assert_eq!(cli_res.payload, Some(serde_json::json!({"ok": 1})));
     }
 }
