@@ -18,8 +18,15 @@ use x509_parser::oid_registry::OID_SIG_ED25519;
 use x509_parser::prelude::*;
 
 pub const CERT_CN_SUFFIX: &str = "-sync";
-pub const CREDENTIAL_URI_PREFIX: &str = "list2cart:vjerodajnice:";
 pub const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+
+pub fn credential_uri_prefix(protocol: &str) -> String {
+    format!("{protocol}:vjerodajnice:")
+}
+
+pub fn credential_urn_prefix(protocol: &str) -> String {
+    format!("urn:{protocol}:vjerodajnice:")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityError {
@@ -35,18 +42,17 @@ pub enum IdentityError {
 impl fmt::Display for IdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPublicKey(m) => write!(f, "neispravan Ed25519 javni kljuc: {m}"),
+            Self::InvalidPublicKey(m) => write!(f, "invalid Ed25519 public key: {m}"),
             Self::KeyFileAlreadyExists(p) => {
-                write!(f, "datoteka kljuca {p} vec postoji — odbijeno prepisivanje")
+                write!(f, "key file already exists: {p}")
             }
-            Self::KeyIo(m) => write!(f, "I/O greska kljuca: {m}"),
-            Self::KeyParse(m) => write!(f, "greska citanja privatnog kljuca: {m}"),
-            Self::CertGen(m) => write!(f, "greska izrade certifikata: {m}"),
-            Self::InvalidPeerCert(m) => write!(f, "neispravan certifikat partnera: {m}"),
-            Self::WrongProtocol { peer, expected } => write!(
-                f,
-                "razmjena odbijena: partner koristi protokol `{peer}`, a ovaj uredjaj `{expected}`"
-            ),
+            Self::KeyIo(m) => write!(f, "key I/O error: {m}"),
+            Self::KeyParse(m) => write!(f, "private key parse error: {m}"),
+            Self::CertGen(m) => write!(f, "certificate generation error: {m}"),
+            Self::InvalidPeerCert(m) => write!(f, "invalid peer certificate: {m}"),
+            Self::WrongProtocol { peer, expected } => {
+                write!(f, "protocol mismatch: peer={peer}, expected={expected}")
+            }
         }
     }
 }
@@ -168,12 +174,12 @@ pub fn build_self_signed_cert_der(
     {
         if cred.len() > MAX_CREDENTIAL_BYTES {
             return Err(IdentityError::CertGen(
-                "vjerodajnice su prevelike".to_owned(),
+                "credentials exceed max size".to_owned(),
             ));
         }
         let uri_str = format!(
-            "urn:{}{}",
-            CREDENTIAL_URI_PREFIX,
+            "{}{}",
+            credential_urn_prefix(protocol),
             URL_SAFE_NO_PAD.encode(cred)
         );
         let ia5 =
@@ -203,7 +209,7 @@ pub fn verify_peer_cert_der(
     let spki = cert.public_key();
     if spki.algorithm.algorithm != OID_SIG_ED25519 {
         return Err(IdentityError::InvalidPeerCert(
-            "certifikat partnera ne nosi Ed25519 kljuc".to_owned(),
+            "peer certificate does not carry an Ed25519 key".to_owned(),
         ));
     }
     let pk_bytes: [u8; 32] = spki
@@ -211,9 +217,7 @@ pub fn verify_peer_cert_der(
         .data
         .as_ref()
         .try_into()
-        .map_err(|_| {
-            IdentityError::InvalidPeerCert("neispravna duljina Ed25519 kljuca".to_owned())
-        })?;
+        .map_err(|_| IdentityError::InvalidPeerCert("invalid Ed25519 key length".to_owned()))?;
     VerifyingKey::from_bytes(&pk_bytes)
         .map_err(|e| IdentityError::InvalidPeerCert(e.to_string()))?;
 
@@ -234,7 +238,7 @@ pub fn verify_peer_cert_der(
 
     let mut credentials = None;
     if let Ok(Some(san)) = cert.subject_alternative_name() {
-        let full_prefix = format!("urn:{CREDENTIAL_URI_PREFIX}");
+        let full_prefix = credential_urn_prefix(expected_protocol);
         for name in &san.value.general_names {
             if let GeneralName::URI(uri) = name
                 && let Some(encoded) = uri.strip_prefix(&full_prefix)

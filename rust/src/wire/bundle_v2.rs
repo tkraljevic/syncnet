@@ -211,7 +211,7 @@ impl ProtectedBundleV2 {
 
     fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128 + self.ciphertext.len());
-        out.extend_from_slice(b"list2cart-bundle-sig-v2|");
+        out.extend_from_slice(format!("{}-bundle-sig-v2|", self.protocol).as_bytes());
         out.extend_from_slice(self.format_version.to_string().as_bytes());
         out.push(b'|');
         out.extend_from_slice(self.protocol.as_bytes());

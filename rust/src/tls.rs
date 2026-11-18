@@ -33,11 +33,33 @@ use tokio_rustls::{
     server::TlsStream as ServerTlsStream,
 };
 
-pub const ALPN_PAIR: &[u8] = b"list2cart-pair/1";
-pub const ALPN_LAN: &[u8] = b"list2cart-lan/1";
-pub const ALPN_WEB: &[u8] = b"list2cart-web/1";
-pub const ALPN_SIG: &[u8] = b"list2cart-sig/1";
-pub const ALPN_TUN: &[u8] = b"list2cart-tun/1";
+pub fn alpn_for(protocol: &str, role: &str) -> Vec<u8> {
+    format!("{protocol}-{role}/1").into_bytes()
+}
+
+pub fn alpn_pair(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "pair")
+}
+
+pub fn alpn_lan(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "lan")
+}
+
+pub fn alpn_web(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "web")
+}
+
+pub fn alpn_sig(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "signal")
+}
+
+pub fn alpn_tun(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "tun")
+}
+
+pub fn alpn_proba(protocol: &str) -> Vec<u8> {
+    alpn_for(protocol, "proba")
+}
 
 pub type CredentialsProvider = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 pub type KeyTrustChecker = Arc<dyn Fn(&[u8; 32], Option<&[u8]>) -> bool + Send + Sync>;
@@ -135,7 +157,7 @@ struct CachedCert {
 }
 
 /// Dynamically resolves our Ed25519 self-signed X.509 certificate, caching the
-/// generated certificate until the node's credentials (`urn:list2cart:vjerodajnice:...`) change.
+/// generated certificate until the node's credentials (`urn:{protocol}:vjerodajnice:...`) change.
 pub struct DynamicCertResolver {
     signing_key: SigningKey,
     protocol: String,
@@ -380,9 +402,7 @@ impl ServerCertVerifier for Ed25519PeerVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Err(RustlsError::General(
-            "TLS 1.2 nije dopusten za List2Cart sinkronizaciju".to_owned(),
-        ))
+        Err(RustlsError::General("TLS 1.2 is not permitted".to_owned()))
     }
 
     fn verify_tls13_signature(
@@ -435,9 +455,7 @@ impl ClientCertVerifier for Ed25519PeerVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Err(RustlsError::General(
-            "TLS 1.2 nije dopusten za List2Cart sinkronizaciju".to_owned(),
-        ))
+        Err(RustlsError::General("TLS 1.2 is not permitted".to_owned()))
     }
 
     fn verify_tls13_signature(
@@ -544,7 +562,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, None)?;
-    let (cfg, state) = build_client_config_with_resolver(resolver, protocol, ALPN_PAIR, None)?;
+    let alpn = alpn_pair(protocol);
+    let (cfg, state) = build_client_config_with_resolver(resolver, protocol, &alpn, None)?;
     let connector = TlsConnector::from(cfg);
     let server_name = sni_for_protocol(protocol)?;
     match connector.connect(server_name, stream).await {
@@ -565,7 +584,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, None)?;
-    let (cfg, state) = build_server_config_with_resolver(resolver, protocol, ALPN_PAIR, None)?;
+    let alpn = alpn_pair(protocol);
+    let (cfg, state) = build_server_config_with_resolver(resolver, protocol, &alpn, None)?;
     let acceptor = TlsAcceptor::from(cfg);
     match acceptor.accept(stream).await {
         Ok(tls_stream) => {
@@ -588,10 +608,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, credentials_fn)?;
+    let alpn = alpn_lan(protocol);
     let (cfg, state) = build_client_config_with_resolver(
         resolver,
         protocol,
-        ALPN_LAN,
+        &alpn,
         Some((*expected_peer_key, addr_label.to_owned())),
     )?;
     let connector = TlsConnector::from(cfg);
@@ -624,8 +645,9 @@ where
     F: Fn(&[u8; 32], Option<&[u8]>) -> bool + Send + Sync + 'static,
 {
     let resolver = DynamicCertResolver::new(sk.clone(), protocol, credentials_fn)?;
+    let alpn = alpn_lan(protocol);
     let (cfg, state) =
-        build_server_config_with_resolver(resolver, protocol, ALPN_LAN, Some(Arc::new(trusted)))?;
+        build_server_config_with_resolver(resolver, protocol, &alpn, Some(Arc::new(trusted)))?;
     let acceptor = TlsAcceptor::from(cfg);
     match acceptor.accept(stream).await {
         Ok(tls_stream) => {
@@ -669,7 +691,7 @@ where
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(Arc::new(NoClientCertResolver));
-    cfg.alpn_protocols = vec![ALPN_LAN.to_vec()];
+    cfg.alpn_protocols = vec![alpn_lan(protocol)];
 
     let connector = TlsConnector::from(Arc::new(cfg));
     let server_name = sni_for_protocol(protocol)?;
@@ -780,7 +802,7 @@ mod tests {
             .unwrap()
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(FixedCertResolver(mismatched_certified)));
-        fake_server_cfg.alpn_protocols = vec![ALPN_LAN.to_vec()];
+        fake_server_cfg.alpn_protocols = vec![alpn_lan("list2cart")];
         let acceptor = TlsAcceptor::from(Arc::new(fake_server_cfg));
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);

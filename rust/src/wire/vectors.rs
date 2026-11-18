@@ -46,11 +46,12 @@ mod tests {
             signature: f["version_signature"].as_str().unwrap().into(),
         };
         assert_eq!(
-            std::str::from_utf8(&v.canonical_signing_bytes()).unwrap(),
+            std::str::from_utf8(&v.canonical_signing_bytes("list2cart")).unwrap(),
             f["version_bytes"].as_str().unwrap()
         );
-        v.verify_signature().expect("verify version signed by Go");
-        assert_eq!(v.clone().sign(&seed).signature, v.signature);
+        v.verify_signature("list2cart")
+            .expect("verify version signed by Go");
+        assert_eq!(v.clone().sign("list2cart", &seed).signature, v.signature);
     }
 
     #[test]

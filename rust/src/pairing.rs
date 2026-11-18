@@ -120,7 +120,7 @@ pub struct PairIdentity {
 impl PairIdentity {
     pub fn to_hello(&self) -> PairHello {
         let name = if self.name.trim().is_empty() {
-            "List2Cart uredjaj".to_owned()
+            "device".to_owned()
         } else {
             self.name.clone()
         };
@@ -187,31 +187,21 @@ pub enum PairingError {
 impl fmt::Display for PairingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotAPeer(m) => write!(f, "veza nije dovrsila TLS rukovanje: {m}"),
-            Self::PeerNotWaitingToPair => write!(
-                f,
-                "drugo racunalo se javilo, ali ne ceka uparivanje — pokrenite uparivanje ondje pa nazovite ponovno"
-            ),
-            Self::WrongProtocol { peer, expected } => write!(
-                f,
-                "druga strana koristi protokol \"{peer}\", a ovaj uredjaj \"{expected}\""
-            ),
-            Self::LegacySasUnsupported => write!(
-                f,
-                "druga strana ima stariji program koji uparuje bez obveze unaprijed (commit-reveal) — nadogradite ga pa uparite ponovno"
-            ),
-            Self::InvalidCommit => write!(
-                f,
-                "druga strana nije postovala obvezu pri dogovoru SAS koda — uparivanje prekinuto"
-            ),
-            Self::SelfPairing => write!(f, "uredjaj se ne moze upariti sam sa sobom"),
-            Self::PeerDisconnectedBeforeConfirm(m) => {
-                write!(f, "druga strana je prekinula vezu prije potvrde koda: {m}")
+            Self::NotAPeer(m) => write!(f, "TLS handshake failed: {m}"),
+            Self::PeerNotWaitingToPair => write!(f, "peer is not waiting to pair"),
+            Self::WrongProtocol { peer, expected } => {
+                write!(f, "protocol mismatch: peer={peer}, expected={expected}")
             }
-            Self::Serialization(m) => write!(f, "greska serijalizacije poruke uparivanja: {m}"),
+            Self::LegacySasUnsupported => write!(f, "legacy SAS without commit is unsupported"),
+            Self::InvalidCommit => write!(f, "invalid SAS commit"),
+            Self::SelfPairing => write!(f, "cannot pair with self"),
+            Self::PeerDisconnectedBeforeConfirm(m) => {
+                write!(f, "peer disconnected before confirmation: {m}")
+            }
+            Self::Serialization(m) => write!(f, "pairing serialization error: {m}"),
             Self::Frame(e) => write!(f, "{e}"),
             Self::Tls(e) => write!(f, "{e}"),
-            Self::Io(m) => write!(f, "mrezna greska pri uparivanju: {m}"),
+            Self::Io(m) => write!(f, "pairing I/O error: {m}"),
         }
     }
 }
@@ -1011,7 +1001,7 @@ mod tests {
             meta: BTreeMap::new(),
         };
 
-        // 1. Wrong protocol rejected at TLS certificate CN verification
+        // 1. Wrong protocol rejected at TLS ALPN / certificate CN verification
         let id_wrong = PairIdentity {
             protocol: "list2cart-sim".to_owned(),
             device_id: "B".to_owned(),
@@ -1024,7 +1014,12 @@ mod tests {
         let id_a1 = id_a.clone();
         let t1 = tokio::spawn(async move { accept_pairing_on(s1, None, &sk_a1, &id_a1).await });
         let r1 = dial_pairing_on(c1, None, &sk_b, &id_wrong).await;
-        assert!(matches!(r1, Err(PairingError::WrongProtocol { .. })));
+        assert!(matches!(
+            r1,
+            Err(PairingError::WrongProtocol { .. }
+                | PairingError::NotAPeer(_)
+                | PairingError::Tls(_))
+        ));
         let _ = t1.await;
 
         // 2. Legacy SAS (< 2) rejected in Hello

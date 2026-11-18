@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// Default UDP discovery port for List2Cart LAN beacons.
+/// Default UDP discovery port.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 45_821;
 
 /// Suffix appended to the protocol name in UDP discovery probe payloads.
