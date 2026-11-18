@@ -7,28 +7,40 @@ ono još nema. Namijenjena je aplikacijama koje podatke drže u SQLiteu.
 
 ## Stanje
 
-Ovo je priprema, a ne biblioteka. Koda ovdje još nema, a repozitorij je
-privatan dok se syncnet ne dovrši.
+Ovo je priprema, a ne gotova biblioteka. Repozitorij je privatan dok se
+syncnet ne dovrši.
 
-Kad kod dođe, za njega će vrijediti ovo:
+Za sve što je ovdje vrijedi:
 
 - alfa je;
-- namijenjen je malim skupinama računala čiji si vlasnici vjeruju;
+- namijenjeno je malim skupinama računala čiji si vlasnici vjeruju;
 - vanjski sigurnosni pregled nije napravljen.
 
 ## Što je ovdje
 
-- [docs/PROTOKOL.md](docs/PROTOKOL.md): nacrt opisa protokola. Kaže što
-  putuje među računalima, kojim redom i u kojem obliku.
-- [vektori](vektori/README.md): ispitni vektori. Druga izvedba protokola
-  koja iz istog ulaza dobije iste bajtove govori istu žicu.
+| Mapa | Što je u njoj |
+|---|---|
+| [docs](docs/PROTOKOL.md) | Nacrt opisa protokola: što putuje među računalima, kojim redom i u kojem obliku. |
+| [vektori](vektori/README.md) | Ispitni vektori. Izvedba koja iz istog ulaza dobije iste bajtove govori istu žicu. |
+| [rust](rust/README.md) | Izvedba u Rustu. |
+| `go` | Izvedba u Gou. Još je nema. |
+
+Izvedbe su odvojene: svaka je u svojoj mapi i gradi se zasebno. Opis
+protokola i vektori su zajednički.
+
+Dvije izvedbe danas ne govore isti razgovor. Temelji su im isti (ključevi,
+uparivanje, članstvo, signal, probijanje), ali izvedba u Rustu ima vlastite
+poruke razgovora, drukčije od onih u opisu protokola. Što se od toga
+ujednačuje, još nije odlučeno.
 
 ## Odakle
 
 Protokol je nastao u programu
 [goCOP](https://github.com/tkraljevic/goCOP), gdje i danas radi. syncnet
 ga izdvaja u biblioteku koju može koristiti bilo koja aplikacija. Opis i
-vektori ovdje pokazuju žicu kakva je danas u tom programu.
+vektori ovdje pokazuju žicu kakva je danas u tom programu. Izvedba u Rustu
+nastala je u programu
+[List2Cart](https://github.com/tkraljevic/List2Cart).
 
 ## Licenca
 
