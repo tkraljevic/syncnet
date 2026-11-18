@@ -98,5 +98,19 @@
     "kljucSlanja": "c69e4c61b3f2c48952c8c7113c1a83d4afe1ab772197a0c8e9e008008e99067c",
     "udarac7": "1000010000112233445566778899aabbccddeeff000000000000000732060bbc6a669c4412a8be03b6815ac3c321137f6f1fbe85811581f90d3c29fc",
     "odgovor7": "1100010000112233445566778899aabbccddeeff000000000000000796f0271d0dd9381c3d5438fea46ca0fd39c438194d50b609ace5df7f54fbd95f"
+  },
+  "posebniZnakovi": {
+    "ime": "a<b>&c",
+    "ovlast": {
+      "bajtovi": "{\"v\":\"ovlast/1\",\"network\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\",\"deviceId\":\"a\\u003cb\\u003e\\u0026c\",\"deviceKey\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"issuedBy\":\"a\\u003cb\\u003e\\u0026c\",\"issuedAt\":1760000000,\"expiresAt\":1760003600}",
+      "potpis": "J0yfJTY6j6Ym4r3S+w6339+AqEjgUp8MEhBKumGGaCpKOzPT2WzHa5rCHR4ar2c9thDYJn6RhVegairCSIhVBw==",
+      "zapis": "{\"network\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\",\"deviceId\":\"a\\u003cb\\u003e\\u0026c\",\"deviceKey\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"issuedBy\":\"a\\u003cb\\u003e\\u0026c\",\"issuedAt\":\"2025-10-09T08:53:20Z\",\"expiresAt\":\"2025-10-09T09:53:20Z\",\"signature\":\"J0yfJTY6j6Ym4r3S+w6339+AqEjgUp8MEhBKumGGaCpKOzPT2WzHa5rCHR4ar2c9thDYJn6RhVegairCSIhVBw==\"}"
+    },
+    "clanstvo": {
+      "bajtovi": "{\"v\":1,\"network\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\",\"deviceId\":\"a\\u003cb\\u003e\\u0026c\",\"deviceKey\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"issuedBy\":\"a\\u003cb\\u003e\\u0026c\",\"issuedAt\":1760000000,\"expiresAt\":1760003600}",
+      "potpis": "AgVFQynbaMzdh57PYKSZG+RJevCvfHBSZgO/cBlDojXqnBycVey3NQPxlcF/vikbcFNFp60VNj3jzk2UPJcXBg==",
+      "zapis": "{\"network\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\",\"deviceId\":\"a\\u003cb\\u003e\\u0026c\",\"deviceKey\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"issuedBy\":\"a\\u003cb\\u003e\\u0026c\",\"issuedAt\":\"2025-10-09T08:53:20Z\",\"expiresAt\":\"2025-10-09T09:53:20Z\",\"signature\":\"AgVFQynbaMzdh57PYKSZG+RJevCvfHBSZgO/cBlDojXqnBycVey3NQPxlcF/vikbcFNFp60VNj3jzk2UPJcXBg==\"}"
+    },
+    "odbijenica": "{\"kind\":\"odbijeno\",\"reason\":\"a\\u003cb\\u003e\\u0026c\",\"kod\":259}\n"
   }
 }

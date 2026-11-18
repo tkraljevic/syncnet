@@ -470,6 +470,13 @@ Razgovor je niz JSON objekata, jedan po retku. Svaki je omotnica:
 novijih izdanja. Jedino `payload` verzije putuje dalje netaknut i kad ga
 primatelj ne razumije.
 
+**Znakovi `<`, `>` i `&` u tekstu pišu se kao `\u003c`, `\u003e` i
+`\u0026`,** kako JSON piše Go. To vrijedi za omotnicu, za kanonske
+bajtove potpisa (odjeljak 7) i za sadržaj verzije: računalo koje verziju
+šalje ili prosljeđuje zapiše `payload` u tom obliku i kad ga je autor
+zadao drukčije. Izvedba zato sadržaj verzije od početka piše tako, inače
+isti zapis na dva računala nema iste bajtove.
+
 Rok je 60 s za slanje i 120 s za primanje jedne poruke.
 
 Najveća primljena poruka ovisi o vrsti koju razgovor čeka:
