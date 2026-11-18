@@ -1,5 +1,12 @@
 # syncnet
 
+> **Još nije za upotrebu. U intenzivnom je razvoju.**
+> Ovo nije biblioteka koju danas možete ugraditi u svoj program. Sučelja,
+> protokol i raspored repozitorija mijenjaju se bez najave, a izdanja nema.
+>
+> **Not usable yet. Under heavy development.** Nothing here is stable and
+> there are no releases.
+
 syncnet će biti biblioteka za razmjenu podataka među računalima bez
 središnjeg poslužitelja. Računala se uparuju uz kod koji potvrde dva
 čovjeka, drže istu knjigu izmjena i u razgovoru jedno drugome daju ono što
@@ -7,14 +14,14 @@ ono još nema. Namijenjena je aplikacijama koje podatke drže u SQLiteu.
 
 ## Stanje
 
-Ovo je priprema, a ne gotova biblioteka. Repozitorij je privatan dok se
-syncnet ne dovrši.
+Ovo je priprema, a ne gotova biblioteka. Što treba znati prije nego što
+išta odavde uzmete:
 
-Za sve što je ovdje vrijedi:
-
-- alfa je;
-- namijenjeno je malim skupinama računala čiji si vlasnici vjeruju;
-- vanjski sigurnosni pregled nije napravljen.
+- ništa nije stabilno i ništa nije izdano;
+- vanjski sigurnosni pregled nije napravljen, pa se na ovaj kod ne
+  oslanjajte za ništa što mora biti sigurno;
+- kad biblioteka bude gotova, bit će namijenjena malim skupinama računala
+  čiji si vlasnici vjeruju.
 
 ## Što je ovdje
 
