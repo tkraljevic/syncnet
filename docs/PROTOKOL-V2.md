@@ -1,6 +1,6 @@
 # Ugovor razgovora — inačica 2 (`<protokol>-razmjena/2`)
 
-Ovaj dokument opisuje prijedlog **inačice 2** razgovora za razmjenu sinkronizacije. Dok ne bude usuglašen i prihvaćen u zajednički ugovor, goCOP i postojeća mreža koriste isključivo inačicu 1 iz [PROTOKOL.md](PROTOKOL.md).
+> **Status: SKICA.** Ovaj dokument je radna skica inačice 2 prema trenutačnom kodu u Rustu i List2Cartu te još nije usuglašen u zajednički ugovor. Dok nije usklađen, goCOP i postojeća mreža koriste isključivo inačicu 1 iz [PROTOKOL.md](PROTOKOL.md).
 
 ## 1. Pregovaranje inačice preko ALPN-a
 
@@ -13,12 +13,12 @@ Ovaj dokument opisuje prijedlog **inačice 2** razgovora za razmjenu sinkronizac
 ## 2. Kadriranje i zajednička omotnica
 
 - Svaka poruka u inačici 2 šalje se kao okvir: **4 bajta duljine (big-endian `u32`) + UTF-8 JSON omotnica**.
-- Omotnica je ista kao u inačici 1:
+- Omotnica je ista kao u inačici 1, s redoslijedom polja:
   - `kind` (`string`) — vrsta poruke,
-  - `deviceId` (`string`, opcionalno) — pošiljatelj,
-  - `payload` (`json`, izostavljeno kod `odbijeno`),
   - `reason` (`string`, samo kod `odbijeno`),
-  - `kod` (`u64`, samo kod `odbijeno`).
+  - `kod` (`u64`, samo kod `odbijeno`),
+  - `deviceId` (`string`, opcionalno) — pošiljatelj,
+  - `payload` (`json`, izostavljeno kod `odbijeno`).
 - Najveća dopuštena veličina okvira provjerava se **po vrsti poruke** koju korak razgovora očekuje:
   - `hello`: 64 KiB
   - `request`: 128 KiB
@@ -28,10 +28,10 @@ Ovaj dokument opisuje prijedlog **inačice 2** razgovora za razmjenu sinkronizac
   - `done`: 16 KiB
   - ukupna gornja granica omotnice: 4 MiB.
 
-## 3. Tijek i vrste poruka (straničenje)
+## 3. Tijek i vrste poruka (skica prema kodu)
 
-1. **`hello`**: obje strane razmjenjuju `protocol`, `deviceId`, `name`, `version`, `capabilities` (mogućnosti), `schema_kinds` i trenutni `frontier` (karta kanal/čvor → zadnji `version_id`).
-2. **`request`**: strana koja traži podatke šalje zahtjev s granicom (`frontier`), željenim kanalima, traženim rasponima rupa (`holes`) i ograničenjem veličine stranice.
-3. **`page`**: pošiljatelj šalje jednu stranicu potpisanih verzija, oznaku `has_more`, ažurirani `frontier` i `holes` dok ne isporuči sve stranice.
+1. **`hello`**: obje strane razmjenjuju `protocol`, `program`, `gradnja`, `mogucnosti` i `vrste` (inačice sheme po entitetima).
+2. **`request`**: potpisani `SyncRequest` iz List2Carta (zahtjev s `frontier`, traženim kanalima/rupama i potpisom pošiljatelja).
+3. **`page`**: pošiljatelj šalje stranicu (`ProtectedBundleV2` / delta ili snapshot stranica) dok ne isporuči sve stranice.
 4. **`zelje` / `sadrzaj`**: po potrebi razmjena binarnog sadržaja po otisku (`SHA-256`).
 5. **`done`** ili **`odbijeno`**: završetak kruga razmjene s brojem primijenjenih zapisa (`applied`) ili odbijenica bez `payload` polja.

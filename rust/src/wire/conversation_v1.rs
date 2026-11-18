@@ -19,17 +19,20 @@ pub const KIND_V1_SADRZAJ: &str = "sadrzaj";
 pub const KIND_V1_DONE: &str = "done";
 pub const KIND_V1_ODBIJENO: &str = "odbijeno";
 
-pub const MAX_V1_CONTROL_LINE_BYTES: usize = 64 * 1024;
-pub const MAX_V1_RUPE_LINE_BYTES: usize = 128 * 1024;
-pub const MAX_V1_DELTA_LINE_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_V1_SADRZAJ_LINE_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_V1_DONE_LINE_BYTES: usize = 16 * 1024;
+pub const MAX_V1_CONTROL_LINE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_V1_RUPE_LINE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_V1_DELTA_LINE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_V1_ZELJE_LINE_BYTES: usize = 1024 * 1024;
+pub const MAX_V1_SADRZAJ_LINE_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_V1_SADRZAJ_UNREQUESTED_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_V1_DONE_LINE_BYTES: usize = 64 * 1024;
 
 pub fn max_line_bytes_for_kind(kind: &str) -> usize {
     match kind {
-        KIND_V1_FRONTIER | KIND_V1_GRANICA_ODBIJENIH | KIND_V1_ZELJE => MAX_V1_CONTROL_LINE_BYTES,
+        KIND_V1_FRONTIER | KIND_V1_GRANICA_ODBIJENIH => MAX_V1_CONTROL_LINE_BYTES,
         KIND_V1_RUPE => MAX_V1_RUPE_LINE_BYTES,
         KIND_V1_DELTA => MAX_V1_DELTA_LINE_BYTES,
+        KIND_V1_ZELJE => MAX_V1_ZELJE_LINE_BYTES,
         KIND_V1_SADRZAJ => MAX_V1_SADRZAJ_LINE_BYTES,
         KIND_V1_DONE | KIND_V1_ODBIJENO => MAX_V1_DONE_LINE_BYTES,
         _ => MAX_V1_CONTROL_LINE_BYTES,
@@ -74,14 +77,14 @@ fn is_false(v: &bool) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvelopeV1 {
     pub kind: String,
-    #[serde(rename = "deviceId", default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Box<RawValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kod: Option<u64>,
+    #[serde(rename = "deviceId", default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Box<RawValue>>,
 }
 
 impl EnvelopeV1 {
@@ -215,6 +218,7 @@ pub struct ZeljePayload {
 pub struct ContentItemV1 {
     pub otisak: String,
     pub vrsta: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kanal: String,
     pub bajtova: u64,
     pub podaci: String,
@@ -415,21 +419,24 @@ mod tests {
             zelje_line
         );
 
-        // sadrzaj
-        let sadrzaj_line = v["sadrzaj"].as_str().unwrap();
-        let sadrzaj_env: EnvelopeV1 = serde_json::from_str(sadrzaj_line.trim_end()).unwrap();
-        let sadrzaj_payload: SadrzajPayload = sadrzaj_env.parse_payload().unwrap();
-        assert_eq!(
-            to_line(
-                &EnvelopeV1::with_payload(
-                    KIND_V1_SADRZAJ,
-                    sadrzaj_env.device_id.as_deref().unwrap(),
-                    &sadrzaj_payload
-                )
-                .unwrap()
-            ),
-            sadrzaj_line
-        );
+        // sadrzaj & sadrzajBezKanala
+        for key in ["sadrzaj", "sadrzajBezKanala"] {
+            let sadrzaj_line = v[key].as_str().unwrap();
+            let sadrzaj_env: EnvelopeV1 = serde_json::from_str(sadrzaj_line.trim_end()).unwrap();
+            let sadrzaj_payload: SadrzajPayload = sadrzaj_env.parse_payload().unwrap();
+            assert_eq!(
+                to_line(
+                    &EnvelopeV1::with_payload(
+                        KIND_V1_SADRZAJ,
+                        sadrzaj_env.device_id.as_deref().unwrap(),
+                        &sadrzaj_payload
+                    )
+                    .unwrap()
+                ),
+                sadrzaj_line,
+                "{key}"
+            );
+        }
 
         // done
         let done_line = v["done"].as_str().unwrap();
@@ -454,16 +461,50 @@ mod tests {
         assert_eq!(ver.payload.get(), r#"{"id":"biljeska-1"}"#);
         assert_eq!(serde_json::to_string(&ver).unwrap(), ver_str);
 
-        // odbijenica (no payload) & posebniZnakovi.odbijenica (`<`, `>`, `&` escaped like Go)
+        // odbijenica (no payload), posebniZnakovi.odbijenica & odbijenicaSRazdjelnicima
         for odb_line in [
             z["odbijenica"].as_str().unwrap(),
             z["posebniZnakovi"]["odbijenica"].as_str().unwrap(),
+            z["posebniZnakovi"]["odbijenicaSRazdjelnicima"]
+                .as_str()
+                .unwrap(),
         ] {
             let odb_env: EnvelopeV1 = serde_json::from_str(odb_line.trim_end()).unwrap();
             assert_eq!(odb_env.kind, KIND_V1_ODBIJENO);
             assert!(odb_env.payload.is_none());
             assert_eq!(to_line(&odb_env), odb_line);
         }
+
+        // U+2028 and U+2029 inside RawValue payload are also escaped as \u2028 and \u2029
+        let raw_sep = RawValue::from_string("{\"t\":\"a\u{2028}b\u{2029}c\"}".to_owned()).unwrap();
+        let ver_sep = VersionV1 {
+            version_id: "0199c82c-0000-7000-8000-000000000004".into(),
+            entity: "biljeske".into(),
+            entity_id: "biljeska-3".into(),
+            node_id: "admin-1".into(),
+            supersedes: String::new(),
+            archived: false,
+            payload: raw_sep,
+            created_at: "2025-10-09T08:53:23Z".into(),
+            schema_version: 1,
+            channel: None,
+        };
+        let sep_json = to_go_json_string(&ver_sep).unwrap();
+        assert!(sep_json.contains(r#""t":"a\u2028b\u2029c""#));
+
+        // Protocol v1 receive limits (docs/PROTOKOL.md, section 9)
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_FRONTIER), 8 * 1024 * 1024);
+        assert_eq!(
+            max_line_bytes_for_kind(KIND_V1_GRANICA_ODBIJENIH),
+            8 * 1024 * 1024
+        );
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_RUPE), 8 * 1024 * 1024);
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_DELTA), 64 * 1024 * 1024);
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_ZELJE), 1024 * 1024);
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_SADRZAJ), 128 * 1024 * 1024);
+        assert_eq!(MAX_V1_SADRZAJ_UNREQUESTED_LINE_BYTES, 64 * 1024);
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_DONE), 64 * 1024);
+        assert_eq!(max_line_bytes_for_kind(KIND_V1_ODBIJENO), 64 * 1024);
 
         // deltaSPosebnimZnakovima built from literal sadrzajSPosebnimZnakovima
         let raw_payload =
