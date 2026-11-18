@@ -111,6 +111,7 @@
       "potpis": "AgVFQynbaMzdh57PYKSZG+RJevCvfHBSZgO/cBlDojXqnBycVey3NQPxlcF/vikbcFNFp60VNj3jzk2UPJcXBg==",
       "zapis": "{\"network\":\"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=\",\"deviceId\":\"a\\u003cb\\u003e\\u0026c\",\"deviceKey\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"issuedBy\":\"a\\u003cb\\u003e\\u0026c\",\"issuedAt\":\"2025-10-09T08:53:20Z\",\"expiresAt\":\"2025-10-09T09:53:20Z\",\"signature\":\"AgVFQynbaMzdh57PYKSZG+RJevCvfHBSZgO/cBlDojXqnBycVey3NQPxlcF/vikbcFNFp60VNj3jzk2UPJcXBg==\"}"
     },
-    "odbijenica": "{\"kind\":\"odbijeno\",\"reason\":\"a\\u003cb\\u003e\\u0026c\",\"kod\":259}\n"
+    "odbijenica": "{\"kind\":\"odbijeno\",\"reason\":\"a\\u003cb\\u003e\\u0026c\",\"kod\":259}\n",
+    "odbijenicaSRazdjelnicima": "{\"kind\":\"odbijeno\",\"reason\":\"a\\u2028b\\u2029c\",\"kod\":259}\n"
   }
 }

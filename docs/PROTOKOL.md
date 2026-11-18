@@ -475,7 +475,8 @@ primatelj ne razumije.
 bajtove potpisa (odjeljak 7) i za sadržaj verzije: računalo koje verziju
 šalje ili prosljeđuje zapiše `payload` u tom obliku i kad ga je autor
 zadao drukčije. Izvedba zato sadržaj verzije od početka piše tako, inače
-isti zapis na dva računala nema iste bajtove.
+isti zapis na dva računala nema iste bajtove. Isto vrijedi za znakove
+U+2028 i U+2029, koji se pišu kao `\u2028` i `\u2029`.
 
 Rok je 60 s za slanje i 120 s za primanje jedne poruke.
 
@@ -843,8 +844,10 @@ Granice pri čitanju: manifest 1 MiB, zapisi 512 MiB, popis sadržaja
 | granica odbijenih | 24 h, samo u memoriji |
 | razmak automatske razmjene | prvi put nakon 30 s, zatim svakih 5 min |
 
-Brojevi su iz koda. Druga izvedba smije primati manje, ali ne smije slati
-više.
+Brojevi su iz koda. Izvedba ne smije slati više od ovoga, a primati mora
+barem onoliko koliko druga strana smije poslati: granice primanja po vrsti
+poruke su u odjeljku 9. Izvedba s manjim granicama primanja odbit će
+ispravne poruke.
 
 ## 19. Kako se protokol mijenja
 

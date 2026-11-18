@@ -44,7 +44,8 @@ Imena računala (`admin-1`, `racunalo-b`), zapis (`biljeske`) i kanal
   bajta duljine, okvir pulsa;
 - udarac od 60 bajtova za oba smjera: smjer, ključ slanja, udarac i
   odgovor s brojačem 7;
-- `posebniZnakovi`: ovlast, članstvo i odbijenica s imenom `a<b>&c`.
+- `posebniZnakovi`: ovlast, članstvo i odbijenica s imenom `a<b>&c`, te
+  odbijenica s razlogom koji nosi U+2028 i U+2029.
 
 ## vektori-razgovora.json
 
@@ -52,7 +53,9 @@ Poruke razgovora kako idu žicom, svaka u omotnici i s novim retkom na
 kraju: `frontier` (s oznakama mogućnosti i bez njih), `granica-odbijenih`,
 `rupe`, `delta` (puna i prazna), `zelje`, `sadrzaj` i `done`. Uz njih jedna
 verzija i vjerodajnice računala A, iste koje vektori žice stavljaju u
-certifikat, te delta s verzijom čiji sadržaj nosi `<`, `>` i `&`.
+certifikat, delta s verzijom čiji sadržaj nosi `<`, `>` i `&`, te
+`sadrzajBezKanala`: stavka sadržaja u zajedničkom kanalu, u kojoj polje
+`kanal` izostaje.
 
 ## Znakovi <, > i &
 
@@ -67,6 +70,8 @@ U JSON-u se znakovi `<`, `>` i `&` u tekstu pišu kao `\u003c`, `\u003e` i
 
 Izvedba koja te znakove piše doslovno dobije druge bajtove, pa joj potpis
 ne vrijedi za ime koje ih sadrži.
+
+Isto vrijedi za U+2028 i U+2029, koji se pišu kao `\u2028` i `\u2029`.
 
 ## Što vektori ne pokrivaju
 
