@@ -32,6 +32,6 @@ vektori ovdje pokazuju žicu kakva je danas u tom programu.
 
 ## Licenca
 
-Licenca će biti MIT. Datoteka licence još nije dodana.
+MIT. Tekst je u datoteci [LICENSE](LICENSE).
 
 Dijelovi ovog projekta razvijeni su uz pomoć alata umjetne inteligencije.
