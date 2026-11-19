@@ -518,11 +518,9 @@ pub fn verify_admitter_chain(
     expires_at: i64,
     now_unix: i64,
 ) -> Result<VerifyingKey, TrustError> {
+    // PROTOKOL §7: `issuedAt` may run up to one hour ahead of the verifier's clock.
     if issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
         return Err(TrustError::IssuedInFuture);
-    }
-    if issued_at > now_unix {
-        return Err(TrustError::NotYetValid);
     }
     if expires_at != 0 && expires_at < issued_at {
         return Err(TrustError::InvalidFormat(
@@ -576,8 +574,13 @@ pub mod rfc3339_unix {
     }
 
     pub fn parse_utc(s: &str) -> Result<i64, String> {
+        const DIGITS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
         let b = s.as_bytes();
-        if b.len() < 20
+        // Untrusted input: all-ASCII keeps every byte slice below on a char boundary,
+        // and explicit digit checks stop `str::parse` from accepting signs like "+1".
+        if !s.is_ascii()
+            || b.len() < 20
+            || DIGITS.iter().any(|&i| !b[i].is_ascii_digit())
             || b[4] != b'-'
             || b[7] != b'-'
             || (b[10] != b'T' && b[10] != b't')
@@ -614,7 +617,8 @@ pub mod rfc3339_unix {
             0
         } else if (rest.starts_with('+') || rest.starts_with('-')) && rest.len() == 6 {
             let sign = if rest.starts_with('+') { 1 } else { -1 };
-            if &rest[3..4] != ":" {
+            let ob = rest.as_bytes();
+            if ob[3] != b':' || ![1, 2, 4, 5].iter().all(|&i| ob[i].is_ascii_digit()) {
                 return Err("invalid timezone offset".into());
             }
             let oh: i64 = rest[1..3].parse().map_err(|_| "invalid offset hour")?;
@@ -671,6 +675,33 @@ pub mod rfc3339_unix {
 mod tests {
     use super::*;
     use crate::identity::{build_self_signed_cert_der, generate_signing_key, verify_peer_cert_der};
+
+    #[test]
+    fn rfc3339_rejects_non_ascii_and_signed_fields_without_panicking() {
+        use rfc3339_unix::parse_utc;
+        assert_eq!(parse_utc("2025-10-09T08:53:20Z"), Ok(1_760_000_000));
+        assert_eq!(parse_utc("2025-10-09T10:53:20+02:00"), Ok(1_760_000_000));
+        assert_eq!(parse_utc("2025-10-09T08:53:20.5Z"), Ok(1_760_000_000));
+        for bad in [
+            "2024-01-01T00:00:0éZ",
+            "2024-01-01T00:00:00+0é00",
+            "2024-01-01T00:00:00+01é0",
+            "202é-01-01T00:00:00Z",
+            "2024-+1-01T00:00:00Z",
+            "2024-01-01T-1:00:00Z",
+            "2024-01-01T00:00:00+-1:00",
+            "2024-01-01T00:00:00.é",
+        ] {
+            assert!(parse_utc(bad).is_err(), "{bad}");
+        }
+        let json = r#"{"issuedAt":"2024-01-01T00:00:0éZ"}"#;
+        #[derive(Deserialize)]
+        struct T {
+            #[serde(rename = "issuedAt", with = "rfc3339_unix")]
+            _issued_at: i64,
+        }
+        assert!(serde_json::from_str::<T>(json).is_err());
+    }
     use crate::tls::{alpn_proba, alpn_sig, alpn_web};
 
     #[test]
@@ -840,6 +871,21 @@ mod tests {
             future.verify(&net.public, &device, now),
             Err(TrustError::IssuedInFuture)
         );
+        // Admitter's clock a few minutes fast: still within the one-hour allowance.
+        for ahead in [5, MAX_CLOCK_SKEW_SECS] {
+            let slightly_ahead = net
+                .admit_member(
+                    "dev",
+                    &device,
+                    "root",
+                    Validity {
+                        issued_at: now + ahead,
+                        valid_for_secs: 3600,
+                    },
+                )
+                .unwrap();
+            assert_eq!(slightly_ahead.verify(&net.public, &device, now), Ok(()));
+        }
         for validity in [
             Validity {
                 issued_at: now,

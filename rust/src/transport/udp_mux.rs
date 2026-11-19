@@ -44,6 +44,7 @@ struct UdpMuxState {
     punch_sessions: Mutex<HashMap<[u8; 16], mpsc::Sender<PunchDatagram>>>,
     recv_waker: Mutex<Option<Waker>>,
     discarded: AtomicU64,
+    send_errors: AtomicU64,
     closed: AtomicBool,
 }
 
@@ -51,6 +52,7 @@ impl fmt::Debug for UdpMuxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UdpMuxState")
             .field("discarded", &self.discarded.load(Ordering::Relaxed))
+            .field("send_errors", &self.send_errors.load(Ordering::Relaxed))
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish()
     }
@@ -146,11 +148,24 @@ impl AsyncUdpSocket for MuxUdpSocket {
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         // Endpoint::close still needs I/O to flush QUIC close packets and drain
         // connection events. The last Endpoint/handle drop releases the socket.
-        self.io.try_io(Interest::WRITABLE, || {
+        let res = self.io.try_io(Interest::WRITABLE, || {
             self.io
                 .try_send_to(transmit.contents, transmit.destination)
                 .map(|_| ())
-        })
+        });
+        match res {
+            // Only WouldBlock goes back to quinn, which then waits for writability.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            // Any other error (unreachable network after a Wi-Fi change, ENOBUFS,
+            // EADDRNOTAVAIL, a dead punch candidate) would end quinn's connection
+            // driver. Like quinn-udp, treat the datagram as lost and let QUIC
+            // loss recovery and the idle timeout decide.
+            Err(_) => {
+                self.state.send_errors.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 
     fn poll_recv(
@@ -279,6 +294,11 @@ impl UdpMuxHandle {
 
     pub fn discarded_count(&self) -> u64 {
         self.state.discarded.load(Ordering::Relaxed)
+    }
+
+    /// QUIC datagrams the OS refused to send (other than WouldBlock); they count as lost.
+    pub fn send_error_count(&self) -> u64 {
+        self.state.send_errors.load(Ordering::Relaxed)
     }
 
     pub fn is_open(&self) -> bool {
@@ -698,5 +718,34 @@ mod tests {
         );
         assert!(reopened.is_open());
         reopened.close();
+    }
+
+    #[tokio::test]
+    async fn send_errors_count_as_loss_instead_of_killing_the_connection() {
+        // A socket bound to loopback cannot send to 192.0.2.1 (TEST-NET-1): the OS
+        // refuses every datagram. Before the fix quinn's driver died at once with
+        // `LocallyClosed`; now the datagrams are lost and the idle timeout decides.
+        let (_server_cfg, mut client_cfg) = make_quic_configs();
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_millis(500).try_into().unwrap()));
+        client_cfg.transport_config(Arc::new(transport));
+
+        let mux = UdpMuxHandle::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let target: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let connecting = mux
+            .endpoint()
+            .connect_with(client_cfg, target, "list2cart-sync")
+            .expect("connect_with");
+        let res = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .expect("connection attempt must end through the idle timeout");
+        assert!(
+            matches!(res, Err(quinn::ConnectionError::TimedOut)),
+            "{res:?}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(mux.send_error_count() >= 1);
+        }
+        mux.close();
     }
 }

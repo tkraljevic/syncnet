@@ -90,18 +90,22 @@ impl fmt::Display for SignalError {
 
 impl std::error::Error for SignalError {}
 
+/// Address candidate in a signal body (`KandidatPoruke` in goCOP: `{"vrsta","adresa"}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateAddr {
-    pub kind: String,
-    pub addr: String,
+    #[serde(default)]
+    pub vrsta: String,
+    #[serde(default)]
+    pub adresa: String,
 }
 
+/// Sender's NAT report (`NATPoruke` in goCOP: `{"vrsta","udpBlokiran"}`, both omitted when empty).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NatReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub udp_blocked: bool,
+    pub vrsta: String,
+    #[serde(rename = "udpBlokiran", default, skip_serializing_if = "is_false")]
+    pub udp_blokiran: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -352,5 +356,39 @@ mod tests {
             ),
             Err(SignalError::WrongRecipient)
         );
+    }
+
+    #[test]
+    fn candidates_and_nat_use_go_field_names() {
+        // Field names and omitempty as in goCOP `KandidatPoruke` and `NATPoruke`.
+        let go_body = r#"{"ver":1,"sesija":"00112233445566778899aabbccddeeff","od":"a","za":"b","sastajaliste":"c","izdano":1760000000,"kandidati":[{"vrsta":"javna","adresa":"203.0.113.7:4242"},{"vrsta":"lokalna","adresa":"192.168.1.20:4242"}],"nat":{"vrsta":"simetricni","udpBlokiran":true}}"#;
+        let body: SignalBody = serde_json::from_str(go_body).expect("Go-shaped signal body");
+        assert_eq!(
+            body.kandidati,
+            vec![
+                CandidateAddr {
+                    vrsta: "javna".into(),
+                    adresa: "203.0.113.7:4242".into(),
+                },
+                CandidateAddr {
+                    vrsta: "lokalna".into(),
+                    adresa: "192.168.1.20:4242".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            body.nat,
+            Some(NatReport {
+                vrsta: "simetricni".into(),
+                udp_blokiran: true,
+            })
+        );
+        assert_eq!(serde_json::to_string(&body).unwrap(), go_body);
+
+        let empty_nat = NatReport {
+            vrsta: String::new(),
+            udp_blokiran: false,
+        };
+        assert_eq!(serde_json::to_string(&empty_nat).unwrap(), "{}");
     }
 }
