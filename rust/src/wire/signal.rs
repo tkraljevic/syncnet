@@ -1,4 +1,5 @@
 use crate::identity::{parse_public_key, public_key_to_base64};
+use crate::wire::go_json::to_go_json_vec;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -91,11 +92,11 @@ impl fmt::Display for SignalError {
 impl std::error::Error for SignalError {}
 
 /// Address candidate in a signal body (`KandidatPoruke` in goCOP: `{"vrsta","adresa"}`).
+/// Go always writes both fields, so a missing one (e.g. the old `{"kind","addr"}` shape)
+/// is rejected instead of silently becoming an empty string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateAddr {
-    #[serde(default)]
     pub vrsta: String,
-    #[serde(default)]
     pub adresa: String,
 }
 
@@ -112,6 +113,19 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+// Go `omitempty` also drops zero numbers, empty strings and empty byte slices.
+fn is_none_or_empty_bytes(v: &Option<Vec<u8>>) -> bool {
+    v.as_ref().is_none_or(|b| b.is_empty())
+}
+
+fn is_none_or_empty_str(v: &Option<String>) -> bool {
+    v.as_ref().is_none_or(|s| s.is_empty())
+}
+
+fn is_none_or_zero(v: &Option<u32>) -> bool {
+    v.is_none_or(|n| n == 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalBody {
@@ -124,27 +138,27 @@ pub struct SignalBody {
     #[serde(
         default,
         with = "opt_base64_bytes",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "is_none_or_empty_bytes"
     )]
     pub tajna: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kandidati: Vec<CandidateAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nat: Option<NatReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
     pub odluka: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
     pub razlog: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_none_or_zero")]
     pub obrada_ms: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_none_or_zero")]
     pub pokusaj: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_none_or_zero")]
     pub rtt_ms: Option<u32>,
     #[serde(
         default,
         with = "opt_base64_bytes",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "is_none_or_empty_bytes"
     )]
     pub vj: Option<Vec<u8>>,
 }
@@ -167,7 +181,8 @@ impl SignedSignalMessage {
     pub fn sign(sk: &SigningKey, protocol: &str, kind: &str, mut body: SignalBody) -> Self {
         body.ver = 1;
         body.od = public_key_to_base64(sk.verifying_key().as_bytes());
-        let raw_body = serde_json::to_vec(&body).expect("signal body serializes");
+        // Same bytes as Go `json.Marshal` (escapes `<`, `>`, `&`, U+2028, U+2029).
+        let raw_body = to_go_json_vec(&body).expect("signal body serializes");
         let mut msg = signal_signing_prefix(protocol, kind);
         msg.extend_from_slice(&raw_body);
         let sig = sk.sign(&msg);
@@ -390,5 +405,50 @@ mod tests {
             udp_blokiran: false,
         };
         assert_eq!(serde_json::to_string(&empty_nat).unwrap(), "{}");
+    }
+
+    #[test]
+    fn candidate_without_go_fields_is_rejected() {
+        let old_shape = r#"{"ver":1,"sesija":"00112233445566778899aabbccddeeff","od":"a","za":"b","sastajaliste":"c","izdano":1760000000,"kandidati":[{"kind":"javna","addr":"203.0.113.7:4242"}]}"#;
+        assert!(serde_json::from_str::<SignalBody>(old_shape).is_err());
+    }
+
+    #[test]
+    fn signed_body_matches_go_marshal() {
+        // Go `omitempty` drops 0, "" and empty []byte; Go escapes <, >, &, U+2028, U+2029.
+        let sender = SigningKey::from_bytes(&[7u8; 32]);
+        let body = SignalBody {
+            ver: 1,
+            sesija: "00112233445566778899aabbccddeeff".to_owned(),
+            od: String::new(),
+            za: "b".to_owned(),
+            sastajaliste: "c".to_owned(),
+            izdano: 1_760_000_000,
+            tajna: Some(vec![]),
+            kandidati: vec![],
+            nat: None,
+            odluka: Some("odbij".to_owned()),
+            razlog: Some("<a> & b\u{2028}".to_owned()),
+            obrada_ms: Some(0),
+            pokusaj: Some(0),
+            rtt_ms: Some(0),
+            vj: Some(vec![]),
+        };
+        let msg = SignedSignalMessage::sign(&sender, "list2cart", SIGNAL_KIND_ODZIV, body);
+        let od = public_key_to_base64(sender.verifying_key().as_bytes());
+        let want = format!(
+            r#"{{"ver":1,"sesija":"00112233445566778899aabbccddeeff","od":"{od}","za":"b","sastajaliste":"c","izdano":1760000000,"odluka":"odbij","razlog":"\u003ca\u003e \u0026 b\u2028"}}"#
+        );
+        assert_eq!(String::from_utf8(msg.tijelo.clone()).unwrap(), want);
+
+        let parsed = msg.parse_unverified_header().unwrap();
+        assert_eq!(parsed.razlog.as_deref(), Some("<a> & b\u{2028}"));
+        assert_eq!(parsed.obrada_ms, None);
+
+        let mut empty_odluka = parsed;
+        empty_odluka.odluka = Some(String::new());
+        empty_odluka.razlog = Some(String::new());
+        let raw = String::from_utf8(to_go_json_vec(&empty_odluka).unwrap()).unwrap();
+        assert!(!raw.contains("odluka") && !raw.contains("razlog"), "{raw}");
     }
 }
