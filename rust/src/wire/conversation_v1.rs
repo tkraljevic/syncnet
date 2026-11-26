@@ -186,6 +186,13 @@ pub struct VersionV1 {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// The author's signature over the version and the author's public key, both base64
+    /// (`wire::version_signature`). Empty for a version without a signature: one made
+    /// before signing existed, or one that came through a peer that does not carry it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub potpis: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kljuc_autora: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -488,6 +495,8 @@ mod tests {
             created_at: "2025-10-09T08:53:23Z".into(),
             schema_version: 1,
             channel: None,
+            potpis: String::new(),
+            kljuc_autora: String::new(),
         };
         let sep_json = to_go_json_string(&ver_sep).unwrap();
         assert!(sep_json.contains(r#""t":"a\u2028b\u2029c""#));
@@ -521,6 +530,8 @@ mod tests {
             created_at: "2025-10-09T08:53:22Z".into(),
             schema_version: 1,
             channel: None,
+            potpis: String::new(),
+            kljuc_autora: String::new(),
         };
         let delta_special = DeltaPayload {
             versions: vec![ver_special],

@@ -5,3 +5,4 @@ pub mod frame;
 pub mod go_json;
 pub mod signal;
 pub mod vectors;
+pub mod version_signature;

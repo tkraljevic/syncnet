@@ -56,6 +56,35 @@ impl Formatter for GoEscapeFormatter {
     }
 }
 
+/// Raw JSON as Go's `json.Marshal(json.RawMessage(raw))` writes it: checked to be one JSON
+/// value, with the spacing between tokens removed and `<`, `>`, `&`, `U+2028`, `U+2029`
+/// escaped. Nothing else changes: key order, numbers and existing escapes stay as written.
+///
+/// Go accepts nesting up to 10 000 levels deep; this accepts what `serde_json` does (128).
+pub fn go_raw_json_vec(raw: &str) -> serde_json::Result<Vec<u8>> {
+    serde_json::from_str::<serde::de::IgnoredAny>(raw)?;
+    let mut compact = Vec::with_capacity(raw.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in raw.as_bytes() {
+        if in_string {
+            compact.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if !matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            in_string = byte == b'"';
+            compact.push(byte);
+        }
+    }
+    let mut out = Vec::with_capacity(compact.len());
+    write_escaped_bytes(&mut out, &compact).expect("writing to a Vec does not fail");
+    Ok(out)
+}
+
 /// Serializes `value` as compact JSON with `<`, `>`, `&`, `U+2028`, `U+2029` escaped like Go's `encoding/json`.
 pub fn to_go_json_vec<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
     let _ = CompactFormatter;

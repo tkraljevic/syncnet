@@ -18,7 +18,7 @@ mod tests {
     use crate::transport::punch::{KIND_PUNCH, KIND_REPLY, PunchKeys};
     use crate::trust::SignedVersionEnvelope;
     use crate::wire::conversation::RefusalCode;
-    use crate::wire::conversation_v1::{DeltaPayload, EnvelopeV1};
+    use crate::wire::conversation_v1::EnvelopeV1;
     use crate::wire::frame::{DEFAULT_MAX_FRAME_LEN, read_frame, write_frame};
     use crate::wire::signal::{
         ReplayCache, SIGNAL_KIND_POZIV, SignalBody, SignalError, SignedSignalMessage,
@@ -77,6 +77,10 @@ mod tests {
         ("signal.tijelo", "signal_body_signature_and_frames"),
         ("signal.potpis", "signal_body_signature_and_frames"),
         ("signal.najveciOkvir", "signal_body_signature_and_frames"),
+        (
+            "potpisVerzije",
+            "wire::version_signature::tests::version_signature_vectors_match_byte_for_byte",
+        ),
         ("udarciA", "punch_keys_and_packets_in_both_directions"),
         ("udarciB", "punch_keys_and_packets_in_both_directions"),
         (
@@ -110,12 +114,6 @@ mod tests {
             "dogovorSCvoromBezOznaka",
             "Rust has no capability negotiation. It comes with the conversation logic.",
         ),
-        (
-            "potpisVerzije",
-            "Rust signs a version in another shape (`<protocol>-ver-v1|[...]`, with the payload \
-             itself) than Go (`<protocol>-verzija-v1|{...}`, with a hash of the payload). Neither \
-             verifies the other's signature. The vector is only checked for soundness.",
-        ),
     ];
 
     /// The same two lists for `vektori-razgovora.json`.
@@ -141,16 +139,15 @@ mod tests {
         ("sadrzajSPosebnimZnakovima", CONVERSATION_TEST),
         ("deltaSPosebnimZnakovima", CONVERSATION_TEST),
         ("sadrzajBezKanala", CONVERSATION_TEST),
+        (
+            "deltaSPotpisom",
+            "wire::version_signature::tests::signed_version_in_a_delta_keeps_its_signature_and_verifies",
+        ),
     ];
     const CONVERSATION_TEST: &str =
         "wire::conversation_v1::tests::conversation_v1_vectors_match_byte_for_byte";
 
     const DIFFERENCES_CONVERSATION: &[(&str, &str)] = &[
-        (
-            "deltaSPotpisom",
-            "The version of the v1 codec has no `potpis` and `kljuc_autora`, so a delta that \
-             Rust reads and writes loses the author's signature.",
-        ),
         ("cop", "Rust has no package for transfer by file (.cop)."),
         (
             "primanje",
@@ -236,55 +233,6 @@ mod tests {
         assert_eq!(text(&c, &["vjerodajnice"]), text(&v, &["vjerodajnice"]));
         let done: EnvelopeV1 = serde_json::from_str(text(&c, &["done"]).trim_end()).expect("done");
         assert_eq!(done.device_id.as_deref(), Some(text(&c, &["posiljatelj"])));
-    }
-
-    /// DIFFERENCES: Rust cannot build these bytes. What is checked is that the vector holds
-    /// together, with the same primitives Rust would use: the hash of the payload as it
-    /// goes on the wire is the one in the signed bytes, and the author's key verifies them.
-    #[test]
-    fn go_version_signature_holds_together() {
-        use ed25519_dalek::{Signature, Verifier};
-        use sha2::{Digest, Sha256};
-
-        let v = vectors();
-        let protocol = text(&v, &["ulaz", "protokol"]);
-        for name in ["obicna", "posebniZnakovi"] {
-            let part = |field: &'static str| text(&v, &["potpisVerzije", name, field]);
-            let signed = part("bajtovi");
-            assert!(
-                signed.starts_with(&format!("{protocol}-verzija-v1|{{")),
-                "{name}"
-            );
-
-            let hash = hex::encode(Sha256::digest(part("oblikSadrzaja").as_bytes()));
-            assert_eq!(hash, part("sadrzaj"), "{name}");
-            assert!(signed.contains(&format!(r#""sadrzaj":"{hash}""#)), "{name}");
-
-            let author = parse_public_key(part("kljucAutora")).expect("author key");
-            let signature =
-                Signature::from_slice(&STANDARD.decode(part("potpis")).unwrap()).unwrap();
-            author
-                .verify(signed.as_bytes(), &signature)
-                .unwrap_or_else(|_| panic!("{name}: the author's key verifies the signed bytes"));
-        }
-    }
-
-    /// DIFFERENCES_CONVERSATION: the envelope passes a signed version through untouched,
-    /// but the typed delta has nowhere to keep the signature. When this test fails, Rust
-    /// keeps it: take `deltaSPotpisom` out of the list and compare the bytes instead.
-    #[test]
-    fn delta_read_and_written_by_rust_loses_the_author_signature() {
-        let c = conversation_vectors();
-        let json = text(&c, &["deltaSPotpisom"])
-            .strip_suffix('\n')
-            .expect("a line ends with a newline");
-        let envelope: EnvelopeV1 = serde_json::from_str(json).expect("envelope");
-        assert_eq!(serde_json::to_string(&envelope).unwrap(), json);
-        assert!(json.contains(r#""potpis":"#) && json.contains(r#""kljuc_autora":"#));
-
-        let delta: DeltaPayload = envelope.parse_payload().expect("delta");
-        let rewritten = serde_json::to_string(&delta).unwrap();
-        assert!(!rewritten.contains("potpis") && !rewritten.contains("kljuc_autora"));
     }
 
     #[test]
@@ -552,11 +500,10 @@ mod tests {
         }
     }
 
-    /// The shared vectors have no entry for the signature over a version, so the expected
-    /// bytes here only pin Rust's own format (`<protocol>-ver-v1|[...]`) against accidental
-    /// change. They do not show agreement with Go: the Go implementation signs a version
-    /// in another shape (`<protocol>-verzija-v1|{...}`, with a hash of the payload), and
-    /// the two do not verify each other's signatures.
+    /// `SignedVersionEnvelope` is an older shape of the Rust implementation only
+    /// (`<protocol>-ver-v1|[...]`); the shared vectors have no entry for it, so the expected
+    /// bytes here only pin it against accidental change. The shape both implementations
+    /// share is in `wire::version_signature` and is checked against the vectors there.
     #[test]
     fn version_signature_binds_all_version_fields() {
         const KEY_A: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=";

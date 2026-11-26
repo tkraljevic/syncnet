@@ -91,9 +91,8 @@ Od 26. 11. 2026. tu su i:
 
 Rust provjerava sve vektore koje može izraditi. Ostalo je popisano
 poimence, s razlogom, u `rust/src/wire/vectors.rs`. Danas su to: vanjska
-poruka signala i puls, dogovor oznaka mogućnosti, potpis verzije, paket
-za prijenos datotekom i primanje na daljinu. Potpis verzije Rust ima, ali
-u drugom obliku, pa dvije izvedbe jedna drugoj ne mogu provjeriti potpis.
+poruka signala i puls, dogovor oznaka mogućnosti, paket za prijenos
+datotekom i primanje na daljinu.
 
 ## Znakovi <, > i &
 

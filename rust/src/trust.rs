@@ -452,6 +452,9 @@ impl Revocation {
     }
 }
 
+/// A signed version in a shape of the Rust implementation only (`<protocol>-ver-v1|[...]`).
+/// The Go implementation does not read it. The author's signature both implementations
+/// share is in [`crate::wire::version_signature`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedVersionEnvelope {
     pub version_id: String,
