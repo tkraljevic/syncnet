@@ -1,77 +1,514 @@
+//! Checks against the shared vectors in `vektori/vektori-zice.json`, which the Go
+//! implementation produced. A vector is "this input gives exactly these bytes"; an
+//! implementation that gets the same bytes speaks the same wire.
+//!
+//! Whatever Rust cannot produce today is named in `DIFFERENCES` with the reason, so a
+//! gap is never skipped silently. The other vectors of that file are checked here or in
+//! the module that owns the format; `CHECKED` says where.
+
 #[cfg(test)]
 mod tests {
-    use crate::identity::{parse_public_key, public_key_to_base64};
+    use crate::identity::{
+        build_self_signed_cert_der, cert_cn_for_protocol, credential_uri_prefix,
+        credential_urn_prefix, parse_public_key, public_key_to_base64, verify_peer_cert_der,
+    };
     use crate::pairing::{SAS_NONCE_LEN, compute_sas_code, compute_sas_commit};
-    use crate::transport::punch::{KIND_PUNCH, PunchKeys};
-    use crate::trust::{NetworkKey, SignedVersionEnvelope};
+    use crate::tls::{alpn_proba, alpn_sig, alpn_web};
+    use crate::transport::discovery::{Beacon, probe_text};
+    use crate::transport::punch::{KIND_PUNCH, KIND_REPLY, PunchKeys};
+    use crate::trust::SignedVersionEnvelope;
+    use crate::wire::conversation::RefusalCode;
+    use crate::wire::conversation_v1::{DeltaPayload, EnvelopeV1};
     use crate::wire::frame::{DEFAULT_MAX_FRAME_LEN, read_frame, write_frame};
     use crate::wire::signal::{
-        ReplayCache, SIGNAL_KIND_POZIV, SignedSignalMessage, verify_signed_signal,
+        ReplayCache, SIGNAL_KIND_POZIV, SignalBody, SignalError, SignedSignalMessage,
+        signal_signing_prefix, verify_signed_signal,
     };
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
     use ed25519_dalek::SigningKey;
+    use serde_json::Value;
     use std::io::Cursor;
 
-    const SEED_A: [u8; 32] = [0x01; 32];
-    const SEED_B: [u8; 32] = [0x02; 32];
-    const SEED_NET: [u8; 32] = [0x10; 32];
+    /// Where each entry of `vektori-zice.json` is checked: here (a test of this module)
+    /// or in the module that owns the format.
+    const CHECKED: &[(&str, &str)] = &[
+        ("ulaz", "keys_come_from_the_seeds"),
+        ("certifikat", "certificate_name_and_credentials_uri"),
+        (
+            "vjerodajnice",
+            "certificate_name_and_credentials_uri; trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        ("alpn", "alpn_and_discovery_texts"),
+        ("pronalazenje", "alpn_and_discovery_texts"),
+        (
+            "uparivanje",
+            "pairing_commitment_and_code; pairing::tests::pairing_wire_vectors_match_byte_for_byte",
+        ),
+        (
+            "ovlast",
+            "trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        (
+            "clanstvoKljucemMreze",
+            "trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        (
+            "clanstvoOdPrimatelja",
+            "trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        (
+            "opoziv",
+            "trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        (
+            "oznakaOpoziva",
+            "trust::tests::gocop_wire_vectors_match_byte_for_byte",
+        ),
+        ("omotnica", "envelope_and_refusal_codes"),
+        (
+            "odbijenica",
+            "envelope_and_refusal_codes; wire::conversation_v1::tests::conversation_v1_vectors_match_byte_for_byte",
+        ),
+        ("kodoviOdbijanja", "envelope_and_refusal_codes"),
+        ("signal.prefiksPotpisa", "signal_body_signature_and_frames"),
+        ("signal.tijelo", "signal_body_signature_and_frames"),
+        ("signal.potpis", "signal_body_signature_and_frames"),
+        ("signal.najveciOkvir", "signal_body_signature_and_frames"),
+        ("udarciA", "punch_keys_and_packets_in_both_directions"),
+        ("udarciB", "punch_keys_and_packets_in_both_directions"),
+        (
+            "posebniZnakovi",
+            "trust::tests::gocop_special_chars_vectors_match_byte_for_byte; wire::conversation_v1::tests::conversation_v1_vectors_match_byte_for_byte",
+        ),
+    ];
 
-    const EXPECTED_PUB_A: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=";
-    const EXPECTED_PUB_B: &str = "gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=";
-    const EXPECTED_PUB_NET: &str = "XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=";
+    /// What the Rust implementation cannot produce today, by vector, with the reason.
+    const DIFFERENCES: &[(&str, &str)] = &[
+        (
+            "signal.poruka",
+            "Rust has no type for the outer signal message {vrsta, tijelo}. The signed part \
+             inside it is produced and compared; the outer object is put together by the test.",
+        ),
+        (
+            "signal.okvir",
+            "Same outer message as signal.poruka. Only the 4-byte length framing is checked, \
+             over the vector's own message.",
+        ),
+        (
+            "signal.okvirPulsa",
+            "Rust has no pulse message. Only the framing is checked, over the literal JSON.",
+        ),
+        (
+            "mogucnosti",
+            "Rust carries capability tags in its messages but has no list of its own tags; \
+             the tags are to be reported by the application.",
+        ),
+        (
+            "dogovorSCvoromBezOznaka",
+            "Rust has no capability negotiation. It comes with the conversation logic.",
+        ),
+        (
+            "potpisVerzije",
+            "Rust signs a version in another shape (`<protocol>-ver-v1|[...]`, with the payload \
+             itself) than Go (`<protocol>-verzija-v1|{...}`, with a hash of the payload). Neither \
+             verifies the other's signature. The vector is only checked for soundness.",
+        ),
+    ];
+
+    /// The same two lists for `vektori-razgovora.json`.
+    const CHECKED_CONVERSATION: &[(&str, &str)] = &[
+        (
+            "posiljatelj",
+            "conversation_vectors_share_sender_and_credentials",
+        ),
+        (
+            "vjerodajnice",
+            "conversation_vectors_share_sender_and_credentials",
+        ),
+        ("frontier", CONVERSATION_TEST),
+        ("frontierBezZnanja", CONVERSATION_TEST),
+        ("granicaOdbijenih", CONVERSATION_TEST),
+        ("rupe", CONVERSATION_TEST),
+        ("delta", CONVERSATION_TEST),
+        ("praznaDelta", CONVERSATION_TEST),
+        ("zelje", CONVERSATION_TEST),
+        ("sadrzaj", CONVERSATION_TEST),
+        ("done", CONVERSATION_TEST),
+        ("verzija", CONVERSATION_TEST),
+        ("sadrzajSPosebnimZnakovima", CONVERSATION_TEST),
+        ("deltaSPosebnimZnakovima", CONVERSATION_TEST),
+        ("sadrzajBezKanala", CONVERSATION_TEST),
+    ];
+    const CONVERSATION_TEST: &str =
+        "wire::conversation_v1::tests::conversation_v1_vectors_match_byte_for_byte";
+
+    const DIFFERENCES_CONVERSATION: &[(&str, &str)] = &[
+        (
+            "deltaSPotpisom",
+            "The version of the v1 codec has no `potpis` and `kljuc_autora`, so a delta that \
+             Rust reads and writes loses the author's signature.",
+        ),
+        ("cop", "Rust has no package for transfer by file (.cop)."),
+        (
+            "primanje",
+            "Rust has no admission at a distance (code, request and confirmation).",
+        ),
+    ];
+
+    fn vectors() -> Value {
+        serde_json::from_str(include_str!("../../../vektori/vektori-zice.json"))
+            .expect("vektori-zice.json")
+    }
+
+    fn conversation_vectors() -> Value {
+        serde_json::from_str(include_str!("../../../vektori/vektori-razgovora.json"))
+            .expect("vektori-razgovora.json")
+    }
+
+    fn text<'a>(v: &'a Value, path: &[&str]) -> &'a str {
+        path.iter()
+            .fold(v, |v, key| &v[*key])
+            .as_str()
+            .unwrap_or_else(|| panic!("vector {} is not text", path.join(".")))
+    }
+
+    fn from_hex<const N: usize>(v: &Value, path: &[&str]) -> [u8; N] {
+        hex::decode(text(v, path))
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or_else(|| panic!("vector {} is not {N} bytes of hex", path.join(".")))
+    }
+
+    fn key(v: &Value, seed: &str) -> SigningKey {
+        SigningKey::from_bytes(&from_hex(v, &["ulaz", seed]))
+    }
+
+    fn public(sk: &SigningKey) -> [u8; 32] {
+        sk.verifying_key().to_bytes()
+    }
+
+    /// Fails for an entry of `v` that is in neither list, and for a listed entry that is
+    /// gone from the file: a stale list is not coverage.
+    fn assert_all_listed(v: &Value, checked: &[(&str, &str)], differences: &[(&str, &str)]) {
+        let known = |path: &str| checked.iter().chain(differences).any(|(p, _)| *p == path);
+        let mut unknown = Vec::new();
+        for (top, value) in v.as_object().expect("vectors are an object") {
+            if known(top) {
+                continue;
+            }
+            // An entry that is not listed whole must have every part listed.
+            match value.as_object() {
+                Some(parts) => unknown.extend(
+                    parts
+                        .keys()
+                        .map(|part| format!("{top}.{part}"))
+                        .filter(|path| !known(path)),
+                ),
+                None => unknown.push(top.clone()),
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "vectors with no test and no named difference: {unknown:?}"
+        );
+        for (path, _) in checked.iter().chain(differences) {
+            let found = path.split('.').try_fold(v, |v, key| v.get(key));
+            assert!(found.is_some(), "{path} is listed but not in the vectors");
+        }
+    }
 
     #[test]
-    fn reproducible_go_fixture_binds_all_version_fields() {
-        let f: serde_json::Value =
-            serde_json::from_str(include_str!("../../testdata/go-vectors.json")).unwrap();
-        assert_eq!(f["public_a"], EXPECTED_PUB_A);
-        assert_eq!(f["public_b"], EXPECTED_PUB_B);
-        assert_eq!(f["public_network"], EXPECTED_PUB_NET);
-        assert_eq!(f["sas"], "087427");
-        let seed = SigningKey::from_bytes(&SEED_A);
-        let v = SignedVersionEnvelope {
-            version_id: "0199c82c-0000-7000-8000-000000000001".into(),
-            entity: "shopping_lists".into(),
-            entity_id: "list-1".into(),
-            node_id: EXPECTED_PUB_A.into(),
-            supersedes: String::new(),
-            archived: false,
-            channel: "list:list-1".into(),
-            created_at: "2025-10-09T08:53:20Z".into(),
-            created_at_unix: 1760000000,
-            schema_version: 1,
-            author_pub_key: EXPECTED_PUB_A.into(),
-            grant_ref: "grant-1".into(),
-            payload: r#"{"name":"Subota"}"#.into(),
-            signature: f["version_signature"].as_str().unwrap().into(),
-        };
-        assert_eq!(
-            std::str::from_utf8(&v.canonical_signing_bytes("list2cart")).unwrap(),
-            f["version_bytes"].as_str().unwrap()
+    fn every_vector_is_checked_or_named_as_a_difference() {
+        assert_all_listed(&vectors(), CHECKED, DIFFERENCES);
+        assert_all_listed(
+            &conversation_vectors(),
+            CHECKED_CONVERSATION,
+            DIFFERENCES_CONVERSATION,
         );
-        v.verify_signature("list2cart")
-            .expect("verify version signed by Go");
-        assert_eq!(v.clone().sign("list2cart", &seed).signature, v.signature);
+    }
+
+    #[test]
+    fn conversation_vectors_share_sender_and_credentials() {
+        let (v, c) = (vectors(), conversation_vectors());
+        assert_eq!(text(&c, &["vjerodajnice"]), text(&v, &["vjerodajnice"]));
+        let done: EnvelopeV1 = serde_json::from_str(text(&c, &["done"]).trim_end()).expect("done");
+        assert_eq!(done.device_id.as_deref(), Some(text(&c, &["posiljatelj"])));
+    }
+
+    /// DIFFERENCES: Rust cannot build these bytes. What is checked is that the vector holds
+    /// together, with the same primitives Rust would use: the hash of the payload as it
+    /// goes on the wire is the one in the signed bytes, and the author's key verifies them.
+    #[test]
+    fn go_version_signature_holds_together() {
+        use ed25519_dalek::{Signature, Verifier};
+        use sha2::{Digest, Sha256};
+
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        for name in ["obicna", "posebniZnakovi"] {
+            let part = |field: &'static str| text(&v, &["potpisVerzije", name, field]);
+            let signed = part("bajtovi");
+            assert!(
+                signed.starts_with(&format!("{protocol}-verzija-v1|{{")),
+                "{name}"
+            );
+
+            let hash = hex::encode(Sha256::digest(part("oblikSadrzaja").as_bytes()));
+            assert_eq!(hash, part("sadrzaj"), "{name}");
+            assert!(signed.contains(&format!(r#""sadrzaj":"{hash}""#)), "{name}");
+
+            let author = parse_public_key(part("kljucAutora")).expect("author key");
+            let signature =
+                Signature::from_slice(&STANDARD.decode(part("potpis")).unwrap()).unwrap();
+            author
+                .verify(signed.as_bytes(), &signature)
+                .unwrap_or_else(|_| panic!("{name}: the author's key verifies the signed bytes"));
+        }
+    }
+
+    /// DIFFERENCES_CONVERSATION: the envelope passes a signed version through untouched,
+    /// but the typed delta has nowhere to keep the signature. When this test fails, Rust
+    /// keeps it: take `deltaSPotpisom` out of the list and compare the bytes instead.
+    #[test]
+    fn delta_read_and_written_by_rust_loses_the_author_signature() {
+        let c = conversation_vectors();
+        let json = text(&c, &["deltaSPotpisom"])
+            .strip_suffix('\n')
+            .expect("a line ends with a newline");
+        let envelope: EnvelopeV1 = serde_json::from_str(json).expect("envelope");
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), json);
+        assert!(json.contains(r#""potpis":"#) && json.contains(r#""kljuc_autora":"#));
+
+        let delta: DeltaPayload = envelope.parse_payload().expect("delta");
+        let rewritten = serde_json::to_string(&delta).unwrap();
+        assert!(!rewritten.contains("potpis") && !rewritten.contains("kljuc_autora"));
+    }
+
+    #[test]
+    fn keys_come_from_the_seeds() {
+        let v = vectors();
+        for (seed, expected) in [
+            ("sjemeA", "kljucA"),
+            ("sjemeB", "kljucB"),
+            ("sjemeMreze", "kljucMreze"),
+        ] {
+            let sk = key(&v, seed);
+            let written = public_key_to_base64(&public(&sk));
+            assert_eq!(written, text(&v, &["ulaz", expected]), "{seed}");
+            assert_eq!(parse_public_key(&written).unwrap(), sk.verifying_key());
+        }
+    }
+
+    #[test]
+    fn certificate_name_and_credentials_uri() {
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        let credentials = text(&v, &["vjerodajnice"]).as_bytes();
+
+        assert_eq!(
+            cert_cn_for_protocol(protocol),
+            text(&v, &["certifikat", "cn"])
+        );
+        assert_eq!(
+            credential_uri_prefix(protocol),
+            text(&v, &["ulaz", "oznakaVjerodajnica"])
+        );
+        assert_eq!(
+            format!(
+                "{}{}",
+                credential_urn_prefix(protocol),
+                URL_SAFE_NO_PAD.encode(credentials)
+            ),
+            text(&v, &["certifikat", "uriVjerodajnica"])
+        );
+
+        // The certificate carries those credentials and gives them back unchanged.
+        let sk = key(&v, "sjemeA");
+        let der = build_self_signed_cert_der(&sk, protocol, Some(credentials)).expect("cert");
+        let verified = verify_peer_cert_der(&der, protocol).expect("verify");
+        assert_eq!(verified.public_key, public(&sk));
+        assert_eq!(verified.credentials.as_deref(), Some(credentials));
+    }
+
+    #[test]
+    fn alpn_and_discovery_texts() {
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+
+        assert_eq!(alpn_sig(protocol), text(&v, &["alpn", "signal"]).as_bytes());
+        assert_eq!(alpn_web(protocol), text(&v, &["alpn", "web"]).as_bytes());
+        assert_eq!(
+            alpn_proba(protocol),
+            text(&v, &["alpn", "proba"]).as_bytes()
+        );
+
+        assert_eq!(probe_text(protocol), text(&v, &["pronalazenje", "proba"]));
+        let beacon_json = text(&v, &["pronalazenje", "beacon"]);
+        let beacon: Beacon = serde_json::from_str(beacon_json).expect("beacon");
+        assert_eq!(beacon.protocol, protocol);
+        assert_eq!(serde_json::to_string(&beacon).unwrap(), beacon_json);
+    }
+
+    #[test]
+    fn pairing_commitment_and_code() {
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        let caller: [u8; SAS_NONCE_LEN] = from_hex(&v, &["ulaz", "brojPozivatelja"]);
+        let listener: [u8; SAS_NONCE_LEN] = from_hex(&v, &["ulaz", "brojSlusalice"]);
+
+        let commit = compute_sas_commit(protocol, &caller);
+        assert_eq!(hex::encode(commit), text(&v, &["uparivanje", "obveza"]));
+        assert_eq!(
+            format!(r#"{{"obveza":"{}"}}"#, STANDARD.encode(commit)),
+            text(&v, &["uparivanje", "porukaObveze"])
+        );
+        assert_eq!(
+            format!(r#"{{"broj":"{}"}}"#, STANDARD.encode(listener)),
+            text(&v, &["uparivanje", "porukaBroja"])
+        );
+        assert_eq!(
+            compute_sas_code(
+                protocol,
+                &public(&key(&v, "sjemeA")),
+                &public(&key(&v, "sjemeB")),
+                &caller,
+                &listener,
+            ),
+            text(&v, &["uparivanje", "kod"])
+        );
+    }
+
+    #[test]
+    fn envelope_and_refusal_codes() {
+        let v = vectors();
+        for name in ["omotnica", "odbijenica"] {
+            let line = text(&v, &[name]);
+            let json = line.strip_suffix('\n').expect("a line ends with a newline");
+            let envelope: EnvelopeV1 = serde_json::from_str(json).expect(name);
+            assert_eq!(serde_json::to_string(&envelope).unwrap(), json, "{name}");
+        }
+
+        let codes = &v["kodoviOdbijanja"];
+        for (name, code) in [
+            ("opce", RefusalCode::General),
+            ("nepoznat-kanal", RefusalCode::UnknownChannel),
+            ("zauzet", RefusalCode::Busy),
+            ("odbijeno", RefusalCode::Refused),
+            ("nije-clan", RefusalCode::NotAMember),
+            ("upis-zauzet", RefusalCode::WriteBusy),
+            ("bez-tailscalea", RefusalCode::NoTailscale),
+        ] {
+            assert_eq!(codes[name].as_u64(), Some(code.as_u64()), "{name}");
+        }
+        assert_eq!(
+            codes.as_object().unwrap().len(),
+            7,
+            "a refusal code was added to the vectors"
+        );
+    }
+
+    fn vector_signal_body(v: &Value) -> SignalBody {
+        SignalBody {
+            ver: 1,
+            sesija: text(v, &["ulaz", "sesija"]).to_owned(),
+            od: String::new(),
+            za: text(v, &["ulaz", "kljucB"]).to_owned(),
+            sastajaliste: text(v, &["ulaz", "kljucMreze"]).to_owned(),
+            izdano: v["ulaz"]["vrijeme"].as_i64().expect("vrijeme"),
+            tajna: None,
+            kandidati: vec![],
+            nat: None,
+            odluka: None,
+            razlog: None,
+            obrada_ms: None,
+            pokusaj: None,
+            rtt_ms: None,
+            vj: None,
+        }
+    }
+
+    #[test]
+    fn signal_body_signature_and_frames() {
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        let (sk_a, sk_b, sk_net) = (key(&v, "sjemeA"), key(&v, "sjemeB"), key(&v, "sjemeMreze"));
+
+        assert_eq!(
+            signal_signing_prefix(protocol, SIGNAL_KIND_POZIV),
+            text(&v, &["signal", "prefiksPotpisa"]).as_bytes()
+        );
+
+        let msg =
+            SignedSignalMessage::sign(&sk_a, protocol, SIGNAL_KIND_POZIV, vector_signal_body(&v));
+        assert_eq!(
+            String::from_utf8(msg.tijelo.clone()).unwrap(),
+            text(&v, &["signal", "tijelo"])
+        );
+        assert_eq!(
+            STANDARD.encode(&msg.potpis),
+            text(&v, &["signal", "potpis"])
+        );
+
+        let body = verify_signed_signal(
+            protocol,
+            &msg,
+            &sk_b.verifying_key(),
+            &sk_net.verifying_key(),
+            v["ulaz"]["vrijeme"].as_i64().unwrap() + 10,
+            &mut ReplayCache::default(),
+            |sender, _| sender == &sk_a.verifying_key(),
+        )
+        .expect("the vector's signal verifies");
+        assert_eq!(body.sesija, text(&v, &["ulaz", "sesija"]));
+
+        // DIFFERENCES: the outer message is the test's, the signed part inside it is Rust's.
+        let message = format!(
+            r#"{{"vrsta":"{SIGNAL_KIND_POZIV}","tijelo":{}}}"#,
+            serde_json::to_string(&msg).unwrap()
+        );
+        assert_eq!(message, text(&v, &["signal", "poruka"]));
+
+        assert_eq!(
+            v["signal"]["najveciOkvir"].as_u64(),
+            Some(DEFAULT_MAX_FRAME_LEN as u64)
+        );
+        for (payload, vector) in [
+            (message.as_bytes(), "okvir"),
+            (
+                br#"{"vrsta":"puls","tijelo":{"odgovori":true}}"#.as_slice(),
+                "okvirPulsa",
+            ),
+        ] {
+            let mut framed = Vec::new();
+            write_frame(&mut framed, payload, DEFAULT_MAX_FRAME_LEN).unwrap();
+            assert_eq!(
+                hex::encode(&framed),
+                text(&v, &["signal", vector]),
+                "{vector}"
+            );
+            assert_eq!(
+                read_frame(&mut Cursor::new(framed), DEFAULT_MAX_FRAME_LEN).unwrap(),
+                payload
+            );
+        }
     }
 
     #[test]
     fn signed_extreme_signal_timestamp_is_rejected_without_overflow() {
-        use crate::wire::signal::{SignalBody, SignalError};
-        let f: serde_json::Value =
-            serde_json::from_str(include_str!("../../testdata/go-vectors.json")).unwrap();
-        let mut body: SignalBody =
-            serde_json::from_str(f["signal_body"].as_str().unwrap()).unwrap();
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        let mut body = vector_signal_body(&v);
         body.izdano = i64::MIN;
-        let sender = SigningKey::from_bytes(&SEED_A);
-        let target = SigningKey::from_bytes(&SEED_B).verifying_key();
-        let rendezvous = SigningKey::from_bytes(&SEED_NET).verifying_key();
-        let msg = SignedSignalMessage::sign(&sender, "list2cart", SIGNAL_KIND_POZIV, body);
+        let msg = SignedSignalMessage::sign(&key(&v, "sjemeA"), protocol, SIGNAL_KIND_POZIV, body);
         assert_eq!(
             verify_signed_signal(
-                "list2cart",
+                protocol,
                 &msg,
-                &target,
-                &rendezvous,
+                &key(&v, "sjemeB").verifying_key(),
+                &key(&v, "sjemeMreze").verifying_key(),
                 i64::MAX,
                 &mut ReplayCache::default(),
                 |_, _| true
@@ -81,153 +518,70 @@ mod tests {
     }
 
     #[test]
-    fn go_vector_public_keys_base64_roundtrip() {
-        let sk_a = SigningKey::from_bytes(&SEED_A);
-        let sk_b = SigningKey::from_bytes(&SEED_B);
-        let sk_net = SigningKey::from_bytes(&SEED_NET);
+    fn punch_keys_and_packets_in_both_directions() {
+        let v = vectors();
+        let protocol = text(&v, &["ulaz", "protokol"]);
+        let session = text(&v, &["ulaz", "sesija"]);
+        let call: [u8; 32] = from_hex(&v, &["ulaz", "tajnaPoziva"]);
+        let response: [u8; 32] = from_hex(&v, &["ulaz", "tajnaOdziva"]);
+        let (a, b) = (public(&key(&v, "sjemeA")), public(&key(&v, "sjemeB")));
 
-        let b64_a = public_key_to_base64(sk_a.verifying_key().as_bytes());
-        let b64_b = public_key_to_base64(sk_b.verifying_key().as_bytes());
-        let b64_net = public_key_to_base64(sk_net.verifying_key().as_bytes());
-
-        assert_eq!(b64_a, EXPECTED_PUB_A);
-        assert_eq!(b64_b, EXPECTED_PUB_B);
-        assert_eq!(b64_net, EXPECTED_PUB_NET);
-
-        assert_eq!(parse_public_key(&b64_a).unwrap(), sk_a.verifying_key());
-        assert_eq!(parse_public_key(&b64_b).unwrap(), sk_b.verifying_key());
-    }
-
-    #[test]
-    fn go_vector_sas_commit_and_leading_zero_code() {
-        let sk_a = SigningKey::from_bytes(&SEED_A);
-        let sk_b = SigningKey::from_bytes(&SEED_B);
-
-        let mut caller_nonce = [0u8; SAS_NONCE_LEN];
-        let mut listener_nonce = [0u8; SAS_NONCE_LEN];
-        for j in 0..SAS_NONCE_LEN {
-            caller_nonce[j] = j as u8;
-            listener_nonce[j] = (0x80 + j) as u8;
+        for (side, mine, theirs) in [("udarciA", &a, &b), ("udarciB", &b, &a)] {
+            let keys = PunchKeys::derive(protocol, session, &call, &response, mine, theirs)
+                .expect("derive");
+            assert_eq!(
+                Some(u64::from(keys.dir)),
+                v[side]["smjer"].as_u64(),
+                "{side}"
+            );
+            assert_eq!(
+                hex::encode(keys.send_key),
+                text(&v, &[side, "kljucSlanja"]),
+                "{side}"
+            );
+            assert_eq!(
+                hex::encode(keys.build_packet(KIND_PUNCH, 7)),
+                text(&v, &[side, "udarac7"]),
+                "{side}"
+            );
+            assert_eq!(
+                hex::encode(keys.build_packet(KIND_REPLY, 7)),
+                text(&v, &[side, "odgovor7"]),
+                "{side}"
+            );
         }
-
-        let commit = compute_sas_commit("list2cart", &caller_nonce);
-        assert_eq!(
-            hex::encode(commit),
-            "e7701f40d4dad8dec9571cf2d3ea6485e2db952117d4311b04fa9c79f9a715ee"
-        );
-
-        let code = compute_sas_code(
-            "list2cart",
-            sk_a.verifying_key().as_bytes(),
-            sk_b.verifying_key().as_bytes(),
-            &caller_nonce,
-            &listener_nonce,
-        );
-        assert_eq!(code, "087427");
     }
 
+    /// The shared vectors have no entry for the signature over a version, so the expected
+    /// bytes here only pin Rust's own format (`<protocol>-ver-v1|[...]`) against accidental
+    /// change. They do not show agreement with Go: the Go implementation signs a version
+    /// in another shape (`<protocol>-verzija-v1|{...}`, with a hash of the payload), and
+    /// the two do not verify each other's signatures.
     #[test]
-    fn go_vector_hkdf_hmac_punch_packet() {
-        let sk_a = SigningKey::from_bytes(&SEED_A);
-        let sk_b = SigningKey::from_bytes(&SEED_B);
-        let sess_hex = "00112233445566778899aabbccddeeff";
-        let call_secret = [0xAAu8; 32];
-        let resp_secret = [0xBBu8; 32];
-
-        let ka = PunchKeys::derive(
-            "list2cart",
-            sess_hex,
-            &call_secret,
-            &resp_secret,
-            sk_a.verifying_key().as_bytes(),
-            sk_b.verifying_key().as_bytes(),
-        )
-        .expect("derive keys");
-
-        assert_eq!(ka.dir, 1);
-        assert_eq!(
-            hex::encode(ka.send_key),
-            "fe5303ce10bf959dfa4a7aef705f57be562a63f35aa065603c9c93c45fa073b8"
-        );
-
-        let pkt = ka.build_packet(KIND_PUNCH, 7);
-        assert_eq!(
-            hex::encode(pkt),
-            "1001010000112233445566778899aabbccddeeff0000000000000007ee343368b74a4231be6c2d32dc5f95ffdf964a835a77e6f8d9ff7b7601551674"
-        );
-    }
-
-    #[test]
-    fn go_vector_ovlast_canonical_bytes_and_signature() {
-        let sk_a = SigningKey::from_bytes(&SEED_A);
-        let sk_net = SigningKey::from_bytes(&SEED_NET);
-        let net = NetworkKey::from_signing_key("Obitelj", sk_net);
-
-        let ovlast = net
-            .issue_ovlast(
-                "admin-1",
-                &sk_a.verifying_key(),
-                "root",
-                1_760_000_000,
-                3600,
-            )
-            .expect("ovlast");
-
-        assert_eq!(
-            String::from_utf8(ovlast.signed_bytes()).unwrap(),
-            r#"{"v":"ovlast/1","network":"XJxt8mHJy4QEdXdqrvzZRLQFMo+rKPmzqV70BJDT3oQ=","deviceId":"admin-1","deviceKey":"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=","issuedBy":"root","issuedAt":1760000000,"expiresAt":1760003600}"#
-        );
-        assert_eq!(
-            ovlast.signature,
-            "Iqu70hDKOqhQHoK6e92ef9YGihpCtdOz9ishVS4GO7++GUYmK3c7E5OwySr2FCXGUbstb2ztoaGN52tY9Z9DAA=="
-        );
-        ovlast
-            .verify(&net.public, 1_760_000_100)
-            .expect("verify vector ovlast");
-    }
-
-    #[test]
-    fn go_vector_signal_raw_body_signature_and_framing() {
-        let sk_a = SigningKey::from_bytes(&SEED_A);
-        let sk_b = SigningKey::from_bytes(&SEED_B);
-        let sk_net = SigningKey::from_bytes(&SEED_NET);
-
-        let raw_body = format!(
-            r#"{{"ver":1,"sesija":"00112233445566778899aabbccddeeff","od":"{EXPECTED_PUB_A}","za":"{EXPECTED_PUB_B}","sastajaliste":"{EXPECTED_PUB_NET}","izdano":1760000000}}"#
-        );
-        let sig_bytes = STANDARD
-            .decode("h6LAu2ormAjdnAPXggIWhMZn5adijcOK+zky6bdU1pjW6w64+7afNCZmgMFYaEnXZkcme/XJm9/Zj1cVZRqQDQ==")
-            .unwrap();
-
-        let msg = SignedSignalMessage {
-            kind: SIGNAL_KIND_POZIV.to_owned(),
-            tijelo: raw_body.into_bytes(),
-            potpis: sig_bytes,
+    fn version_signature_binds_all_version_fields() {
+        const KEY_A: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=";
+        let seed = SigningKey::from_bytes(&[0x01; 32]);
+        let v = SignedVersionEnvelope {
+            version_id: "0199c82c-0000-7000-8000-000000000001".into(),
+            entity: "shopping_lists".into(),
+            entity_id: "list-1".into(),
+            node_id: KEY_A.into(),
+            supersedes: String::new(),
+            archived: false,
+            channel: "list:list-1".into(),
+            created_at: "2025-10-09T08:53:20Z".into(),
+            created_at_unix: 1760000000,
+            schema_version: 1,
+            author_pub_key: KEY_A.into(),
+            grant_ref: "grant-1".into(),
+            payload: r#"{"name":"Subota"}"#.into(),
+            signature: "+SiCX03oxCKskTFykV1Xt2QcprHLYYRhrmvU0LdvBA8yPwVTG0I9ONbN6h2LsW9sOqyFU1rwVQzfK9GwWUyGBA==".into(),
         };
-
-        let mut cache = ReplayCache::default();
-        let body = verify_signed_signal(
-            "list2cart",
-            &msg,
-            &sk_b.verifying_key(),
-            &sk_net.verifying_key(),
-            1_760_000_010,
-            &mut cache,
-            |vk, _| vk == &sk_a.verifying_key(),
-        )
-        .expect("verify Go-signed signal vector");
-        assert_eq!(body.sesija, "00112233445566778899aabbccddeeff");
-
-        // Also test 4-byte big-endian framing over serialized signal wrapper
-        let wire_json = serde_json::to_vec(&msg).unwrap();
-        let mut framed = Vec::new();
-        write_frame(&mut framed, &wire_json, DEFAULT_MAX_FRAME_LEN).unwrap();
         assert_eq!(
-            u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize,
-            wire_json.len()
+            std::str::from_utf8(&v.canonical_signing_bytes("list2cart")).unwrap(),
+            r#"list2cart-ver-v1|[1,"shopping_lists","list-1","0199c82c-0000-7000-8000-000000000001","iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=","",false,"list:list-1","2025-10-09T08:53:20Z",1760000000,"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=","grant-1","{\"name\":\"Subota\"}"]"#
         );
-        let mut cur = Cursor::new(framed);
-        let unframed = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN).unwrap();
-        assert_eq!(unframed, wire_json);
+        v.verify_signature("list2cart").expect("verify");
+        assert_eq!(v.clone().sign("list2cart", &seed).signature, v.signature);
     }
 }

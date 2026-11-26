@@ -4,6 +4,9 @@ Vektor je par „ovaj ulaz daje točno ove bajtove”. Druga izvedba protokola
 koja iz istog ulaza dobije iste bajtove govori istu žicu.
 
 Vektore je izradio kod programa iz kojeg syncnet nastaje, 18. 11. 2026.
+Dopunjeni su 26. 11. 2026. iz istog programa: potpis verzije, paket za
+prijenos datotekom i primanje na daljinu. Stari vektori pritom nisu
+promijenjeni.
 Ed25519 potpis i zapis JSON-a za isti ulaz daju isti izlaz, pa se vektori
 izrađuju ponovljivo: izrađeni su dvaput i oba puta su bili isti.
 
@@ -24,7 +27,13 @@ programa u kojem je protokol nastao. Druga aplikacija ima svoje, pa će
 dobiti druge bajtove svuda gdje ime ili oznaka ulaze u izračun.
 
 Imena računala (`admin-1`, `racunalo-b`), zapis (`biljeske`) i kanal
-(`primjer/7/2026`) su izmišljeni.
+(`primjer/7/2026`) su izmišljeni. Izmišljena je i osoba u vektoru potpisa
+verzije. Vrste zapisa `users` i `readings` u tom vektoru i kanal
+`ocitanja/16/2026` imena su iz programa u kojem je protokol nastao; druga
+aplikacija ima svoja.
+
+Primanje na daljinu ima još dva stalna ulaza: sol od 16 bajtova `0xCC` i
+kod `7KQ4-M2XD`.
 
 ## vektori-zice.json
 
@@ -39,13 +48,20 @@ Imena računala (`admin-1`, `racunalo-b`), zapis (`biljeske`) i kanal
 - omotnica poruke razgovora i odbijenica, s novim retkom na kraju;
 - kodovi odbijanja, oznake mogućnosti i dogovor s računalom bez oznaka
   (popis oznaka nosi i jednu oznaku samog programa, `dijelovi-karte/1`;
-  u syncnetu će takve oznake prijavljivati aplikacija);
+  u syncnetu će takve oznake prijavljivati aplikacija). Među oznakama je
+  od 26. 11. 2026. i `potpis-verzije/1`;
 - signal: prefiks potpisa, tijelo poziva, potpis, poruka, okvir od 4
   bajta duljine, okvir pulsa;
 - udarac od 60 bajtova za oba smjera: smjer, ključ slanja, udarac i
   odgovor s brojačem 7;
 - `posebniZnakovi`: ovlast, članstvo i odbijenica s imenom `a<b>&c`, te
-  odbijenica s razlogom koji nosi U+2028 i U+2029.
+  odbijenica s razlogom koji nosi U+2028 i U+2029;
+- `potpisVerzije`: verzija iz knjige koju potpiše njezin autor, računalo
+  A. Za svaku od dvije verzije tu su podaci kako stoje u knjizi (`ulaz`),
+  sadržaj kako ide žicom (`oblikSadrzaja`), njegov SHA-256 (`sadrzaj`),
+  bajtovi koji se potpisuju, ključ autora i potpis. Druga verzija ima
+  sadržaj s razmacima, sa znakovima `<`, `>` i `&` i s U+2028, vrijeme s
+  dijelovima sekunde i druge vrijednosti ostalih polja.
 
 ## vektori-razgovora.json
 
@@ -56,6 +72,28 @@ verzija i vjerodajnice računala A, iste koje vektori žice stavljaju u
 certifikat, delta s verzijom čiji sadržaj nosi `<`, `>` i `&`, te
 `sadrzajBezKanala`: stavka sadržaja u zajedničkom kanalu, u kojoj polje
 `kanal` izostaje.
+
+Od 26. 11. 2026. tu su i:
+
+- `deltaSPotpisom`: delta s verzijom koja nosi potpis autora (`potpis` i
+  `kljuc_autora`), kako ide računalu s oznakom `potpis-verzije/1`. Potpis
+  pokriva oblik iz vektora `potpisVerzije`;
+- `cop`: dijelovi paketa za prijenos datotekom koji se potpisuju ili
+  otiskuju: zapisi, popis sadržaja, otisak izdanja, kanonski zapis
+  manifesta, potpis ključem A i manifest. Sve to dvaput: za paket bez rupa
+  (inačica 3) i s rupama (inačica 4);
+- `primanje`: primanje novog računala na daljinu: kod koji čovjek prepiše,
+  ključ dokaza, zahtjev novog računala (bajtovi, dokaz i potpis ključem B)
+  i potvrda primatelja. Ključ dokaza je scrypt (N = 2^16, r = 8, p = 1) nad
+  kodom bez crtice i soli, s oznakom `gocop-primanje/1|`.
+
+## Što izvedba u Rustu iz ovoga ne dobije
+
+Rust provjerava sve vektore koje može izraditi. Ostalo je popisano
+poimence, s razlogom, u `rust/src/wire/vectors.rs`. Danas su to: vanjska
+poruka signala i puls, dogovor oznaka mogućnosti, potpis verzije, paket
+za prijenos datotekom i primanje na daljinu. Potpis verzije Rust ima, ali
+u drugom obliku, pa dvije izvedbe jedna drugoj ne mogu provjeriti potpis.
 
 ## Znakovi <, > i &
 
@@ -76,6 +114,5 @@ Isto vrijedi za U+2028 i U+2029, koji se pišu kao `\u2028` i `\u2029`.
 ## Što vektori ne pokrivaju
 
 STUN, QUIC sesiju i njezin kontrolni kanal, poruke `odziv` i `sinkro`,
-prijavu kod sastajališta, zahtjev i potvrdu primanja na daljinu, kopiju
-ključa mreže i paket za prijenos datotekom. Cijeli certifikat nije vektor,
-jer mu serijski broj i rok ovise o satu.
+prijavu kod sastajališta i kopiju ključa mreže. Cijeli certifikat nije
+vektor, jer mu serijski broj i rok ovise o satu.
