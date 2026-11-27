@@ -37,8 +37,10 @@ Razmjena ide samo među članovima iste mreže.
 | računalo (čvor) | jedna instalacija aplikacije: svoja baza, svoj ključ i ime |
 | ime računala | tekst po kojem se računalo zove u mreži; ne smije sadržavati `\|` |
 | verzija | jedan nepromjenjiv zapis o stanju jednog zapisa aplikacije |
-| oznaka verzije | UUIDv7; poredak oznaka je poredak nastanka |
+| oznaka verzije | UUIDv7; poredak oznaka je poredak nastanka po satu autora |
 | autor | ime računala na kojem je verzija nastala |
+| knjiga | sve verzije koje računalo drži |
+| površina | stanje zapisa koje aplikacija pokazuje; slaže ga iz verzija u knjizi (odjeljak 11, „Sukob dviju izmjena”) |
 | kanal | tekst koji verzije dijeli u skupine; prazan kanal drže svi članovi |
 | ključ granice | `autor` za prazan kanal, inače `autor\|kanal` |
 | granica | za svaki ključ granice najveća oznaka verzije koju računalo ima |
@@ -52,13 +54,14 @@ Biblioteka nema svoje zadane vrijednosti. Aplikacija zadaje:
 
 | Što | Gdje se koristi |
 |---|---|
-| ime protokola | ime certifikata, pronalaženje, uparivanje, potpisi signala, ključevi udaraca, ALPN |
+| ime protokola | ime certifikata, pronalaženje, uparivanje, potpisi signala, potpis verzije, ključevi udaraca, ALPN |
 | oznake formata | vjerodajnice u certifikatu, zahtjev i potvrda primanja na daljinu, kopija ključa mreže |
 | portove | razmjena, uparivanje, pronalaženje, WEB sync |
 | vrste zapisa i njihove sheme | polje `vrste` u granici |
 | značenje kanala | biblioteci je kanal samo tekst |
 | pravilo „želim li ovaj kanal” | što se šalje i što se prima |
 | dodatne oznake mogućnosti i korake | proširenja razgovora |
+| pravilo površine | što se od više verzija istog zapisa vidi (odjeljak 11, „Sukob dviju izmjena”) |
 
 **Ime protokola** ima najviše 32 znaka: mala slova i brojke, a crtica samo
 između njih. Računala s različitim imenom protokola ne mogu se upariti ni
@@ -624,6 +627,8 @@ Bez `payload`. `reason` i `kod` su u omotnici.
 | `created_at` | vrijeme, RFC 3339 | sat autora; samo obavijest, ne za poredak |
 | `schema_version` | cijeli broj | shema zapisa |
 | `channel` | tekst, izostaje kad je prazan | kanal |
+| `potpis` | tekst, izostaje kad je prazan | potpis autora, base64; samo uz `potpis-verzije/1` |
+| `kljuc_autora` | tekst, izostaje kad je prazan | javni ključ kojim je autor potpisao, base64; samo uz `potpis-verzije/1` |
 
 Primatelj ne prima verziju:
 
@@ -640,6 +645,161 @@ pravilima ne šalje ono što primatelj ne bi primio.
 
 Verzija je zatvorena: polje koje starije izdanje ne poznaje ono odbaci i
 verziju dalje šalje bez njega. Novi podatak o zapisu zato ide u `payload`.
+Iznimka su polja potpisa autora, opisana niže.
+
+### Potpis autora
+
+Računalo ključem računala (odjeljak 4) potpisuje svaku svoju novu
+verziju. Potpis kaže da je verziju potpisao baš taj ključ i da joj usput
+nitko nije promijenio nijedan potpisani podatak. Smije li taj ključ
+pisati pod imenom iz `node_id`, odlučuje primatelj.
+
+Potpis je Ed25519 nad oznakom `<protokol>-verzija-v1|`, iza koje odmah
+ide kanonski JSON verzije. Potpis se piše kao standardni base64. Kanonski
+JSON piše se kao u odjeljku 7: zbijen i s poljima točno ovim redom.
+
+```json
+{"version_id":"…","entity":"…","entity_id":"…","node_id":"…","supersedes":"…","archived":false,"channel":"","schema_version":1,"created_at":1760000000,"kljuc_autora":"…","sadrzaj":"…"}
+```
+
+- Sva polja su uvijek tu. Prazan kanal i prazan `supersedes` pišu se kao
+  `""`.
+- `created_at` su cijele sekunde Unix vremena iz polja `created_at`
+  verzije. Dio ispod sekunde otpada, jer ne preživi svaki put.
+- `kljuc_autora` je javni ključ autora u zapisu iz odjeljka 4, isti koji
+  putuje uz verziju.
+- `sadrzaj` je otisak sadržaja verzije u obliku u kojem ide žicom:
+  zbijen, s ključevima istim redom, a znakovi `<`, `>`, `&`, U+2028 i
+  U+2029 pišu se kao u odjeljku 9. Isti zapis tako daje isti otisak i kad
+  ga je računalo spremilo s razmacima. Sadržaj koji nije jedna JSON
+  vrijednost ne da se potpisati.
+
+Promjena bilo kojeg od ovih podataka kvari potpis. Ime protokola u oznaci
+znači da potpis iz mreže s drugim imenom protokola ovdje ne vrijedi.
+
+Potpis pokriva sadržaj, pa ne može stajati u njemu. Zato su `potpis` i
+`kljuc_autora` polja verzije, a ne dio `payload`, i idu samo uz oznaku
+mogućnosti (odjeljak 19, pravilo 7).
+
+Vektor `potpisVerzije` u `vektori-zice.json` ima dvije verzije, `obicna`
+i `posebniZnakovi`. Za svaku su tu podaci kako stoje u knjizi, sadržaj u
+obliku sa žice, njegov otisak, bajtovi koji se potpisuju, ključ autora i
+potpis. Druga verzija ima kanal, `supersedes`, `archived`, ime autora
+`a<b>&c`, sadržaj s razmacima i znakovima `<`, `>`, `&` i U+2028 te
+vrijeme s dijelom sekunde. `deltaSPotpisom` u `vektori-razgovora.json` je
+delta s potpisanom verzijom kako ide žicom.
+
+**Slanje.** `potpis` i `kljuc_autora` idu uz verziju samo kad obje strane
+imaju oznaku `potpis-verzije/1`. Računalu bez oznake pošiljatelj šalje
+verziju bez ta dva polja, pa ono dobije deltu bajt po bajt kakvu je
+dobivalo i prije. Računalo s oznakom primljeni potpis provjeri, spremi uz
+verziju i šalje ga dalje računalima s oznakom. Računalo bez oznake polja
+ne poznaje i verziju šalje dalje bez njih. Verzija bez potpisa zato nije
+nužno krivotvorina: možda je nastala prije potpisivanja ili je prošla
+kroz takvo računalo.
+
+**Primanje.** Potpis se gleda nakon pravila iz popisa iznad, i kad
+pošiljatelj nema oznaku.
+
+- Verzija koja nosi `potpis` ili `kljuc_autora` prolazi samo kad potpis
+  vrijedi pod ključem iz `kljuc_autora`. Kriv potpis, ili samo jedno od
+  dvaju polja, ne vrijedi nikad. Takva verzija se preskoči. U razgovoru
+  ide i u granicu odbijenih (odjeljak 14.2), pa je pošiljatelj uz oznaku
+  `granica-odbijenih/1` ne šalje ponovno.
+- Ispravan potpis vrijedi tek kad je taj ključ ikad imao članstvo pod
+  imenom iz `node_id`, s potpisom koji je vrijedio u trenutku izdavanja
+  (odjeljak 7). Računa se i isteklo i opozvano članstvo, pa opoziv ne
+  poništava verzije potpisane tim ključem. Računaju se i članstva iz iste
+  delte ili istog paketa. Pod imenom primatelja vrijedi i njegov vlastiti
+  ključ.
+- Kad ključ još nije vezan uz ime, verzija čeka. Ne upisuje se i ne ide u
+  granicu odbijenih, pa je pošiljatelj šalje ponovno sve dok je granica
+  primatelja za taj ključ granice ispod nje. Kad članstvo u međuvremenu
+  stigne, verzija prođe. Ako primatelj u istom primanju upiše noviju
+  verziju istog ključa, granica prijeđe preko verzije koja čeka. Zato je
+  primatelj zapiše kao rupu koju traži (odjeljak 14.3), a ne kao odbijenu.
+- Verzija bez potpisa za sada se prima kao i prije. Aplikacija smije za
+  svoje vrste zapisa tražiti strože. Tada verzija takve vrste bez potpisa
+  čeka kad obje strane imaju `potpis-verzije/1`, autor nije primatelj, a
+  primatelj u knjizi već ima potpisanu verziju tog autora. Takav
+  pošiljatelj potpis ne skida. Verzija bez potpisa od njega zato je
+  nastala prije potpisivanja, prošla je kroz računalo bez oznake ili ju
+  je netko napisao bez ključa autora.
+
+**Dopuna.** Kad verzija u knjizi stoji bez potpisa, a verzija s istom
+oznakom stigne potpisana i prođe provjeru, primatelj upiše potpis uz
+spremljenu verziju, ako potpis vrijedi i nad njom. Potpis koji već stoji
+ne zamjenjuje se. Tako potpis može stići i naknadno, na primjer paketom
+(odjeljak 17), do računala do kojeg je verzija prvo došla kroz računalo
+bez oznake.
+
+Autor smije naknadno potpisati i svoje verzije napisane prije nego što je
+počeo potpisivati, istim bajtovima i svojim ključem, ali samo one koje je
+sam napisao, ne one koje je pod svojim imenom primio. Tada ih šalje
+potpisane, a primatelj koji traži potpis za tu vrstu zapisa prima ih.
+
+### Sukob dviju izmjena
+
+Kad dva računala izmijene isti zapis prije nego što se usklade, nastanu
+dvije verzije istog zapisa. Obje putuju i obje ostaju u knjizi svakog
+računala. Biblioteka nijednu ne odbacuje i ne spaja.
+
+Poredak verzija je poredak oznaka. Oznaka je UUIDv7 u kanonskom obliku, pa
+se dvije oznake uspoređuju kao tekst. Prvih 48 bita je vrijeme sata autora
+u milisekundama. Kad je milisekunda ista, odlučuje ostatak oznake. Poredak
+je zato isti na svakom računalu. `created_at` i `supersedes` u poretku ne
+sudjeluju.
+
+Kad aplikacija ne kaže drukčije, vidi se zadnja verzija zapisa po tom
+poretku. Starija verzija koja stigne poslije ne vraća zapis unatrag.
+Brisanje je verzija kao i svaka druga: kad je zadnje, zapisa nema, a
+novija živa verzija ga vraća.
+
+Pobjeđuje, dakle, izmjena čiji sat kaže da je kasnija, a ne ona koja je
+stvarno nastala kasnije:
+
+- Sat koji žuri do 5 minuta pobjeđuje izmjene koje su u tom razmaku
+  stvarno nastale poslije.
+- Verziju s vremenom više od 5 minuta ispred svog sata primatelj ne
+  upisuje i ne pamti kao odbijenu. Granica mu se ne pomakne, pa je
+  pošiljatelj šalje dok joj vrijeme ne dođe. Tada se upiše i pobijedi sve
+  što je u međuvremenu napisano s manjim vremenom.
+- Izmjena koja izgubi ne vidi se. Ostaje u knjizi i putuje dalje, dok je
+  čišćenje povijesti ne makne. Biblioteka o tome nikoga ne obavještava.
+- Verzija nosi cijeli zapis. Dvije izmjene različitih polja istog zapisa
+  se ne spajaju: vidi se jedna.
+- Potpis autora poredak ne mijenja. Kaže samo tko je verziju napisao, pa
+  posrednik potpisanu verziju ne može pomaknuti naprijed ni napisati je
+  pod tuđim imenom. Autor i dalje svojim satom stavlja svoju izmjenu
+  ispred tuđe.
+
+Pravilo ne provodi knjiga. Knjiga drži i šalje sve verzije, a površinu
+slaže aplikacija iz verzija koje joj biblioteka preda nakon upisa. Zato
+aplikacija smije za neke vrste zapisa imati svoje pravilo, npr.:
+
+- složiti zapis iz cijele povijesti, tako da ostanu bilješke iz obje
+  izmjene;
+- pokazati zadnju verziju s nekim svojstvom, npr. ovjerenu, a ne zadnju
+  po poretku;
+- dati prednost brisanju nadređenog zapisa, pa se podređeni zapis ne vidi
+  dok se nadređeni ne vrati;
+- pokazati obje izmjene kao dva zapisa;
+- zadržati verziju u knjizi bez prikaza dok je ne potvrdi netko tko na to
+  ima pravo.
+
+Svako takvo pravilo mora iz istog skupa verzija dati istu površinu na
+svakom računalu, bez obzira na to kojim su redom i u kojim paketima
+verzije stigle. Smije gledati samo verzije u knjizi, a ne sat, redoslijed
+primanja ni podatke koje drži samo jedno računalo. Isto vrijedi za
+vlastitu izmjenu: aplikacija koja je stavi na površinu mimo pravila
+pokazat će je na računalu autora i kad je u poretku ispod tuđe.
+
+Pravilo ne stvara nove verzije: svako računalo napisalo bi svoju, i one
+bi se opet sukobile. Aplikacija koja površinu slaže iz povijesti mora reći
+koje verzije čišćenje povijesti ne smije maknuti.
+
+Računala koja ne drže iste kanale ili ne primaju iste verzije nemaju isti
+skup, pa smiju imati drukčiju površinu.
 
 ## 12. Oznake mogućnosti
 
@@ -661,6 +821,7 @@ Oznaka je `ime/N`. Ime su mala slova, znamenke i `-`, najviše 32 znaka.
 | `granica-odbijenih/1` | poruka `granica-odbijenih` iza granica |
 | `rupe/1` | poruka `rupe`; polja `rupe` i `popuna` u delti |
 | `web/1` | računalo prima WEB sync; javlja je samo dok mu je WEB sync uključen |
+| `potpis-verzije/1` | polja `potpis` i `kljuc_autora` u verziji (odjeljak 11); računalo s oznakom primljeni potpis provjerava, sprema i šalje dalje |
 
 Aplikacija smije prijaviti i svoje oznake uz svoje dodatne korake.
 
@@ -735,6 +896,14 @@ Uz oznaku `rupe/1`:
 
 Vlastiti ključ nikad nema rupu.
 
+Verzija koja čeka provjeru potpisa (odjeljak 11) ide među ono što
+računalo traži, nikad među odbijeno. Iznad granice zapiše se samo kad isto
+primanje upisuje noviju verziju istog ključa. Ispod granice zapiše se samo
+kad stigne u popuni za koju druga strana jamči, a nema je u knjizi.
+Traženje počinje od najveće verzije istog ključa ispod nje koju računalo
+ima, pa popuna poslije šalje uglavnom samo nju. Dok čeka, takva verzija
+stiže svakom razmjenom s računalom koje za nju jamči.
+
 ## 15. Kanali i želje
 
 Kanal je tekst bez znaka `|`. Prazan kanal drže svi članovi. Što kanal
@@ -780,6 +949,12 @@ Paket potpisuje ključ računala koje ga je izdalo. Uvoz odbija paket novije
 inačice, s krivim otiskom ili potpisom, od izdavača koji nije član iste
 mreže, starije izdanje istog izdavača i isto izdanje s drugim sadržajem.
 Zapise uvoz uzima kao razmjena: samo ono što računalo želi.
+
+Redak u `zapisi.jsonl` nosi `potpis` i `kljuc_autora` kad ih verzija
+ima, bez obzira na oznake mogućnosti. Polja su neobavezna i stariji
+program ih zanemari, pa paket zbog njih nema novu inačicu. Uvoz potpis
+provjerava po pravilima iz odjeljka 11. Verzija s krivim potpisom se
+preskoči, a strože pravilo za verzije bez potpisa pri uvozu ne vrijedi.
 
 Nepoznata stavka u paketu je greška. Novi dio paketa zato uvijek traži
 novu inačicu.
@@ -864,7 +1039,9 @@ Starije izdanje ne smije zapeti ni pasti.
 6. Kanonski bajtovi potpisa se ne mijenjaju. Novi oblik dobiva novu
    oznaku inačice, a stari se i dalje čita.
 7. Novi podatak o zapisu ide u `payload` verzije, ne u novu kolonu
-   verzije.
+   verzije. Novo polje verzije smije doći samo uz oznaku mogućnosti, a
+   izvedba mora podnijeti verziju koja ga je izgubila kroz starije
+   računalo. Takva su polja potpisa autora (odjeljak 11).
 
 ## 20. Što u ovom opisu još nije opće
 
