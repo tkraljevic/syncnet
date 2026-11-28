@@ -229,7 +229,15 @@ mod tests {
         let protocol = v["ulaz"]["protokol"].as_str().unwrap();
         let author = author(&v);
 
-        for name in ["obicna", "posebniZnakovi"] {
+        for name in [
+            "obicna",
+            "posebniZnakovi",
+            // Numbers and escapes stay in the payload's shape as written: `1.0`, `1e2`,
+            // `\u0041`, `\/`, and `\u003C` with a capital C.
+            "sadrzajSBrojevimaIBijegovima",
+            // U+2028 in `entity_id` and in the channel, signed as `\u2028`.
+            "razdjelnikUPoljima",
+        ] {
             let vector = &v["potpisVerzije"][name];
             let text = |field: &str| vector[field].as_str().unwrap();
             let input = |field: &str| vector["ulaz"][field].as_str().unwrap();
@@ -303,6 +311,51 @@ mod tests {
                 "{name}: a signature from another protocol"
             );
         }
+    }
+
+    /// The shared edge table: the plain version with the signature and the author's key
+    /// written in many ways, and what Go's check says of each. Go computed the outcomes;
+    /// a version with neither field is unsigned, any other is valid or wrong.
+    #[test]
+    fn signature_edge_vectors_end_as_in_go() {
+        let v = wire_vectors();
+        let protocol = v["ulaz"]["protokol"].as_str().unwrap();
+        let plain = &v["potpisVerzije"]["obicna"]["ulaz"];
+        let text = |field: &str| plain[field].as_str().unwrap().to_owned();
+        let edges = v["potpisVerzije"]["rubovi"].as_array().unwrap();
+        assert!(!edges.is_empty());
+
+        let mut wrong = Vec::new();
+        for edge in edges {
+            let field = |name: &str| edge[name].as_str().unwrap();
+            let (name, go) = (field("opis"), field("ishod"));
+            let version = VersionV1 {
+                version_id: text("version_id"),
+                entity: text("entity"),
+                entity_id: text("entity_id"),
+                node_id: text("node_id"),
+                supersedes: text("supersedes"),
+                archived: plain["archived"].as_bool().unwrap(),
+                payload: serde_json::value::RawValue::from_string(text("payload")).unwrap(),
+                created_at: text("created_at"),
+                schema_version: u32::try_from(plain["schema_version"].as_u64().unwrap()).unwrap(),
+                channel: Some(text("channel")).filter(|c| !c.is_empty()),
+                potpis: field("potpis").to_owned(),
+                kljuc_autora: field("kljuc_autora").to_owned(),
+            };
+            let got = match verify_version_v1(protocol, &version) {
+                Ok(()) => "vrijedi",
+                Err(VersionSignatureError::Unsigned) => "nepotpisana",
+                Err(VersionSignatureError::BadAuthorKey | VersionSignatureError::BadSignature) => {
+                    "kriv"
+                }
+                Err(e) => panic!("{name}: {e}"),
+            };
+            if got != go {
+                wrong.push(format!("{name}: Go {go}, Rust {got}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
