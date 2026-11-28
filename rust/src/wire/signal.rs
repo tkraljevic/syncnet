@@ -1,4 +1,4 @@
-use crate::identity::{parse_public_key, public_key_to_base64};
+use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::wire::go_json::to_go_json_vec;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -131,6 +131,10 @@ fn is_none_or_zero(v: &Option<u32>) -> bool {
 pub struct SignalBody {
     pub ver: u32,
     pub sesija: String,
+    /// The sender's key as the message carries it. Several texts read to the same key
+    /// (`\n` anywhere, extra bits in the last character, as in Go), so to compare, map,
+    /// block or revoke by the sender use the key the check hands to `is_trusted`, or
+    /// `public_key_to_base64` of the bytes this text reads to, never this text.
     pub od: String,
     pub za: String,
     pub sastajaliste: String,
@@ -248,7 +252,10 @@ where
     F: FnOnce(&VerifyingKey, Option<&[u8]>) -> bool,
 {
     let body = msg.parse_unverified_header()?;
-    let sender_vk = parse_public_key(&body.od).map_err(|_| SignalError::UnknownSender)?;
+    // As in Go: a key that does not read is an unknown sender, one that reads but is not a
+    // point a bad signature.
+    let sender = parse_public_key_bytes(&body.od).map_err(|_| SignalError::UnknownSender)?;
+    let sender_vk = VerifyingKey::from_bytes(&sender).map_err(|_| SignalError::BadSignature)?;
 
     // Verify signature strictly over the raw wire bytes of `tijelo`, never re-serialized!
     let mut signed = signal_signing_prefix(protocol, &msg.kind);
@@ -450,5 +457,85 @@ mod tests {
         empty_odluka.razlog = Some(String::new());
         let raw = String::from_utf8(to_go_json_vec(&empty_odluka).unwrap()).unwrap();
         assert!(!raw.contains("odluka") && !raw.contains("razlog"), "{raw}");
+    }
+
+    /// The sender's key in `od` is read as Go reads it: a key that does not read is an
+    /// unknown sender, a key that reads but is not a point is a bad signature.
+    #[test]
+    fn sender_key_reads_as_in_go() {
+        use crate::identity::key_edges::assert_edges_as_in_go;
+
+        let me = SigningKey::from_bytes(&[3; 32]);
+        let rendezvous = SigningKey::from_bytes(&[4; 32]);
+        let at = 1_760_000_000i64;
+        #[rustfmt::skip]
+        let table = [
+            ("ispravno", "prima", "prima"),
+            ("prazno", "nepoznat", "nepoznat"),
+            ("samo_razmak", "nepoznat", "nepoznat"),
+            ("nije_base64", "nepoznat", "nepoznat"),
+            ("31B", "nepoznat", "nepoznat"),
+            ("33B", "nepoznat", "nepoznat"),
+            ("bez_paddinga", "nepoznat", "nepoznat"),
+            ("visak_paddinga", "nepoznat", "nepoznat"),
+            ("razmak_ispred", "nepoznat", "prima"),
+            ("razmak_iza", "nepoznat", "prima"),
+            ("tab_iza", "nepoznat", "prima"),
+            ("novi_red_ispred", "prima", "prima"),
+            ("novi_red_iza", "prima", "prima"),
+            ("crlf_iza", "prima", "prima"),
+            ("novi_red_u_sredini", "prima", "nepoznat"),
+            ("visak_bitova", "prima", "nepoznat"),
+            ("url_safe", "nepoznat", "nepoznat"),
+            ("url_safe_kanonski", "prima", "prima"),
+            ("nije_tocka", "kriv:potpis", "nepoznat"),
+            ("identitet", "prima", "prima"),
+            ("identitet_nekanonski_y", "prima", "prima"),
+            ("identitet_s_predznakom", "prima", "prima"),
+            ("red2_R_identitet", "kriv:potpis", "kriv:potpis"),
+            ("red2_R_tocka", "prima", "prima"),
+        ];
+        assert_edges_as_in_go(&table, |edge| {
+            let body = SignalBody {
+                ver: 1,
+                sesija: "00112233445566778899aabbccddeeff".into(),
+                od: edge.key.clone(),
+                za: public_key_to_base64(me.verifying_key().as_bytes()),
+                sastajaliste: public_key_to_base64(rendezvous.verifying_key().as_bytes()),
+                izdano: at,
+                tajna: None,
+                kandidati: vec![],
+                nat: None,
+                odluka: None,
+                razlog: None,
+                obrada_ms: None,
+                pokusaj: None,
+                rtt_ms: None,
+                vj: None,
+            };
+            let tijelo = to_go_json_vec(&body).unwrap();
+            let mut signed = signal_signing_prefix("gocop", SIGNAL_KIND_POZIV);
+            signed.extend_from_slice(&tijelo);
+            let msg = SignedSignalMessage {
+                kind: SIGNAL_KIND_POZIV.into(),
+                potpis: edge.signer.sign(&signed).to_vec(),
+                tijelo,
+            };
+            let got = verify_signed_signal(
+                "gocop",
+                &msg,
+                &me.verifying_key(),
+                &rendezvous.verifying_key(),
+                at,
+                &mut ReplayCache::default(),
+                |_, _| true,
+            );
+            match got {
+                Ok(_) => "prima".into(),
+                Err(SignalError::UnknownSender) => "nepoznat".into(),
+                Err(SignalError::BadSignature) => "kriv:potpis".into(),
+                Err(e) => format!("drugo:{e}"),
+            }
+        });
     }
 }

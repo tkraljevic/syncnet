@@ -1,4 +1,5 @@
-use crate::identity::{parse_public_key, public_key_to_base64};
+use crate::identity::{parse_public_key, parse_public_key_bytes, public_key_to_base64};
+use crate::wire::go_base64::decode_std;
 use crate::wire::go_json::to_go_json_vec;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -400,10 +401,11 @@ impl Revocation {
         .expect("canonical revocation serializes")
     }
 
+    /// The id is made from the signature's bytes, read as Go reads them: a text that
+    /// reads to the same bytes gives the same id. A signature that does not read is a bad
+    /// signature (Go then takes the revocation as not signed).
     pub fn compute_id(&self) -> Result<String, TrustError> {
-        let sig = STANDARD
-            .decode(&self.signature)
-            .map_err(|_| TrustError::BadSignature)?;
+        let sig = decode_std(&self.signature).map_err(|_| TrustError::BadSignature)?;
         let digest = Sha256::digest(&sig);
         Ok(format!(
             "{}:{}:{}:{}",
@@ -422,29 +424,42 @@ impl Revocation {
         self
     }
 
+    /// Says whether the revocation holds on its own: its id comes from its content and
+    /// signature, and the signature holds under the key named as its signer. Whether that
+    /// key may revoke is for the caller to decide.
+    ///
+    /// The signer's key is read as Go reads it and must stand exactly as Go writes that
+    /// key (canonical base64): Go takes a revocation as signed by a key only then. The
+    /// revoked key (`public_key`) is not read, as in Go: a revocation revokes only a key
+    /// written the same (`revokes`), so one with any other text revokes nothing. Compare
+    /// `public_key` only as text, as `revokes` does, never by the bytes it reads to.
     pub fn verify_self(&self) -> Result<VerifyingKey, TrustError> {
         self.scope()?;
-        let subject = parse_public_key(&self.public_key).map_err(|_| TrustError::BadSignature)?;
-        if public_key_to_base64(subject.as_bytes()) != self.public_key
-            || self.target_id.is_empty()
-            || self.issued_at < 0
-            || self.revoked_at < self.issued_at
-        {
+        if self.target_id.is_empty() || self.issued_at < 0 || self.revoked_at < self.issued_at {
             return Err(TrustError::InvalidFormat(
-                "invalid revocation subject or timestamps".into(),
+                "invalid revocation target or timestamps".into(),
             ));
         }
-        let signer = parse_public_key(&self.signer_key).map_err(|_| TrustError::BadSignature)?;
+        let signer =
+            parse_public_key_bytes(&self.signer_key).map_err(|_| TrustError::BadSignature)?;
         let expected_id = self.compute_id()?;
         if self.id != expected_id {
             return Err(TrustError::InvalidFormat(
                 "invalid revocation id".to_owned(),
             ));
         }
+        if public_key_to_base64(&signer) != self.signer_key {
+            return Err(TrustError::BadSignature);
+        }
+        let signer = VerifyingKey::from_bytes(&signer).map_err(|_| TrustError::BadSignature)?;
         verify_ed25519_b64(&signer, &self.signed_bytes(), &self.signature)?;
         Ok(signer)
     }
 
+    /// Compares the revoked key as text. `subject_pub_b64` must be the canonical text of
+    /// the key (`public_key_to_base64` of the key's bytes), never the text a record
+    /// carried: Go reads a key with `\n` in it or with extra bits in its last character as
+    /// the same key, so a record's own text can differ from the one the revocation names.
     pub fn revokes(&self, subject_pub_b64: &str, issued_at: i64) -> bool {
         self.scope() == Ok("membership")
             && self.public_key == subject_pub_b64
@@ -467,6 +482,9 @@ pub struct SignedVersionEnvelope {
     pub created_at: String,
     pub created_at_unix: i64,
     pub schema_version: u32,
+    /// The author's key as the record carries it. Several texts read to the same key
+    /// (`\n` anywhere, extra bits in the last character), so to compare, map or revoke by
+    /// the author take `public_key_to_base64` of the key `verify_signature` returns.
     pub author_pub_key: String,
     pub grant_ref: String,
     pub payload: String,
@@ -502,8 +520,13 @@ impl SignedVersionEnvelope {
         self
     }
 
+    /// The author's key is read as Go reads the author's key of the shared signature
+    /// ([`crate::wire::version_signature`]): a key that does not read is an invalid record
+    /// (a bad author key there), and one that reads but is not a point is a bad signature.
     pub fn verify_signature(&self, protocol: &str) -> Result<VerifyingKey, TrustError> {
-        let vk = parse_public_key(&self.author_pub_key).map_err(|_| TrustError::BadSignature)?;
+        let key = parse_public_key_bytes(&self.author_pub_key)
+            .map_err(|_| TrustError::InvalidFormat("invalid author key".into()))?;
+        let vk = VerifyingKey::from_bytes(&key).map_err(|_| TrustError::BadSignature)?;
         verify_ed25519_b64(
             &vk,
             &self.canonical_signing_bytes(protocol),
@@ -540,13 +563,16 @@ pub fn verify_admitter_chain(
     if ovlast.device_id != issued_by {
         return Err(TrustError::IssuerMismatch);
     }
+    // As in Go: a key that does not read is a bad signature, and so is one that reads but
+    // is not a point (Go finds that out when it verifies the signature under it).
     parse_public_key(&ovlast.device_key).map_err(|_| TrustError::BadSignature)
 }
 
+/// The signature is read as Go reads it (`base64.StdEncoding`, see
+/// [`crate::wire::go_base64`]): no trimming, `\r` and `\n` skipped, extra bits in the last
+/// character not checked, and exactly 64 bytes.
 pub fn verify_ed25519_b64(vk: &VerifyingKey, msg: &[u8], sig_b64: &str) -> Result<(), TrustError> {
-    let sig_bytes = STANDARD
-        .decode(sig_b64.trim())
-        .map_err(|_| TrustError::BadSignature)?;
+    let sig_bytes = decode_std(sig_b64).map_err(|_| TrustError::BadSignature)?;
     let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| TrustError::BadSignature)?;
     let sig = Signature::from_bytes(&sig_arr);
     vk.verify(msg, &sig).map_err(|_| TrustError::BadSignature)
@@ -1134,5 +1160,525 @@ mod tests {
         clanstvo
             .verify(&net.public, &sk_a.verifying_key(), now)
             .unwrap();
+    }
+
+    mod key_edges {
+        use super::*;
+        use crate::identity::key_edges::{KeyEdge, assert_edges_as_in_go, edge_signer};
+
+        const AT: i64 = 1_760_000_000;
+
+        fn b64(vk: &VerifyingKey) -> String {
+            public_key_to_base64(vk.as_bytes())
+        }
+
+        fn member() -> SigningKey {
+            SigningKey::from_bytes(&[5; 32])
+        }
+
+        /// A membership issued by an admitter whose key in the ovlast is the edge.
+        fn membership_outcome(edge: &KeyEdge) -> String {
+            let net = SigningKey::from_bytes(&[9; 32]);
+            let mut ovlast = Ovlast {
+                network: b64(&net.verifying_key()),
+                device_id: "primatelj-1".into(),
+                device_key: edge.key.clone(),
+                issued_by: "admin-1".into(),
+                issued_at: AT,
+                expires_at: AT + 48 * 3600,
+                signature: String::new(),
+            };
+            ovlast.signature = STANDARD.encode(net.sign(&ovlast.signed_bytes()).to_bytes());
+            let mut m = Membership {
+                network: ovlast.network.clone(),
+                device_id: "clan-1".into(),
+                device_key: b64(&member().verifying_key()),
+                issued_by: "primatelj-1".into(),
+                issued_at: AT,
+                expires_at: AT + 24 * 3600,
+                signature: String::new(),
+                admitter: Some(ovlast),
+            };
+            m.signature = STANDARD.encode(edge.signer.sign(&m.signed_bytes()));
+            match m.verify(&net.verifying_key(), &member().verifying_key(), AT + 100) {
+                Ok(()) => "vrijedi".into(),
+                Err(TrustError::BadSignature) => "kriv:potpis".into(),
+                Err(e) => format!("drugo:{e}"),
+            }
+        }
+
+        /// The admitter's key in the ovlast is read as Go reads it when it checks who
+        /// signed a membership: a key that does not read and a key that is not a point
+        /// are both a bad signature.
+        #[test]
+        fn admitter_key_in_ovlast_reads_as_in_go() {
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "vrijedi", "vrijedi"),
+                ("prazno", "kriv:potpis", "kriv:potpis"),
+                ("samo_razmak", "kriv:potpis", "kriv:potpis"),
+                ("nije_base64", "kriv:potpis", "kriv:potpis"),
+                ("31B", "kriv:potpis", "kriv:potpis"),
+                ("33B", "kriv:potpis", "kriv:potpis"),
+                ("bez_paddinga", "kriv:potpis", "kriv:potpis"),
+                ("visak_paddinga", "kriv:potpis", "kriv:potpis"),
+                ("razmak_ispred", "kriv:potpis", "vrijedi"),
+                ("razmak_iza", "kriv:potpis", "vrijedi"),
+                ("tab_iza", "kriv:potpis", "vrijedi"),
+                ("novi_red_ispred", "vrijedi", "vrijedi"),
+                ("novi_red_iza", "vrijedi", "vrijedi"),
+                ("crlf_iza", "vrijedi", "vrijedi"),
+                ("novi_red_u_sredini", "vrijedi", "kriv:potpis"),
+                ("visak_bitova", "vrijedi", "kriv:potpis"),
+                ("url_safe", "kriv:potpis", "kriv:potpis"),
+                ("url_safe_kanonski", "vrijedi", "vrijedi"),
+                ("nije_tocka", "kriv:potpis", "kriv:potpis"),
+                ("identitet", "vrijedi", "vrijedi"),
+                ("identitet_nekanonski_y", "vrijedi", "vrijedi"),
+                ("identitet_s_predznakom", "vrijedi", "vrijedi"),
+                ("red2_R_identitet", "vrijedi", "vrijedi"),
+                ("red2_R_tocka", "vrijedi", "vrijedi"),
+            ];
+            assert_edges_as_in_go(&table, membership_outcome);
+        }
+
+        fn revocation(signer_key: &str, subject: &str, signer: &KeyEdge) -> Revocation {
+            let mut r = Revocation {
+                id: String::new(),
+                kind: "clanstvo".into(),
+                target_id: "cvor-1".into(),
+                public_key: subject.into(),
+                issued_at: AT,
+                revoked_at: AT + 3600,
+                revoked_by: "admin-1".into(),
+                signer_key: signer_key.into(),
+                signature: String::new(),
+            };
+            r.signature = STANDARD.encode(signer.signer.sign(&r.signed_bytes()));
+            r.id = r.compute_id().unwrap();
+            r
+        }
+
+        fn self_valid(r: &Revocation) -> String {
+            match r.verify_self() {
+                Ok(_) => "ispravan".into(),
+                Err(_) => "neispravan".into(),
+            }
+        }
+
+        /// The signer of a revocation is read as Go reads it, and must stand in the
+        /// revocation exactly as Go writes that key: Go takes a revocation as signed by a
+        /// key only when the text is that key's canonical base64.
+        #[test]
+        fn revocation_signer_reads_as_in_go() {
+            let subject = b64(&member().verifying_key());
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "ispravan", "ispravan"),
+                ("prazno", "neispravan", "neispravan"),
+                ("samo_razmak", "neispravan", "neispravan"),
+                ("nije_base64", "neispravan", "neispravan"),
+                ("31B", "neispravan", "neispravan"),
+                ("33B", "neispravan", "neispravan"),
+                ("bez_paddinga", "neispravan", "neispravan"),
+                ("visak_paddinga", "neispravan", "neispravan"),
+                ("razmak_ispred", "neispravan", "ispravan"),
+                ("razmak_iza", "neispravan", "ispravan"),
+                ("tab_iza", "neispravan", "ispravan"),
+                ("novi_red_ispred", "neispravan", "ispravan"),
+                ("novi_red_iza", "neispravan", "ispravan"),
+                ("crlf_iza", "neispravan", "ispravan"),
+                ("novi_red_u_sredini", "neispravan", "neispravan"),
+                ("visak_bitova", "neispravan", "neispravan"),
+                ("url_safe", "neispravan", "neispravan"),
+                ("url_safe_kanonski", "ispravan", "ispravan"),
+                ("nije_tocka", "neispravan", "neispravan"),
+                ("identitet", "ispravan", "ispravan"),
+                ("identitet_nekanonski_y", "ispravan", "ispravan"),
+                ("identitet_s_predznakom", "ispravan", "ispravan"),
+                ("red2_R_identitet", "ispravan", "ispravan"),
+                ("red2_R_tocka", "neispravan", "neispravan"),
+            ];
+            assert_edges_as_in_go(&table, |edge| {
+                self_valid(&revocation(&edge.key, &subject, edge))
+            });
+        }
+
+        /// Go does not read the revoked key at all when it checks a revocation on its own:
+        /// any text is the subject, and a revocation revokes only a key written the same.
+        #[test]
+        fn revocation_subject_is_not_read_as_in_go() {
+            let signer = KeyEdge {
+                name: "potpisnik",
+                key: b64(&edge_signer().verifying_key()),
+                signer: crate::identity::key_edges::EdgeSigner::Key(edge_signer()),
+            };
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "ispravan", "ispravan"),
+                ("prazno", "ispravan", "neispravan"),
+                ("samo_razmak", "ispravan", "neispravan"),
+                ("nije_base64", "ispravan", "neispravan"),
+                ("31B", "ispravan", "neispravan"),
+                ("33B", "ispravan", "neispravan"),
+                ("bez_paddinga", "ispravan", "neispravan"),
+                ("visak_paddinga", "ispravan", "neispravan"),
+                ("razmak_ispred", "ispravan", "neispravan"),
+                ("razmak_iza", "ispravan", "neispravan"),
+                ("tab_iza", "ispravan", "neispravan"),
+                ("novi_red_ispred", "ispravan", "neispravan"),
+                ("novi_red_iza", "ispravan", "neispravan"),
+                ("crlf_iza", "ispravan", "neispravan"),
+                ("novi_red_u_sredini", "ispravan", "neispravan"),
+                ("visak_bitova", "ispravan", "neispravan"),
+                ("url_safe", "ispravan", "neispravan"),
+                ("url_safe_kanonski", "ispravan", "ispravan"),
+                ("nije_tocka", "ispravan", "neispravan"),
+                ("identitet", "ispravan", "ispravan"),
+                ("identitet_nekanonski_y", "ispravan", "ispravan"),
+                ("identitet_s_predznakom", "ispravan", "ispravan"),
+                ("red2_R_identitet", "ispravan", "ispravan"),
+                ("red2_R_tocka", "ispravan", "ispravan"),
+            ];
+            assert_edges_as_in_go(&table, |edge| {
+                self_valid(&revocation(&signer.key, &edge.key, &signer))
+            });
+        }
+
+        /// The older envelope is read by Rust only. Its author's key is read as Go reads
+        /// the author's key of the signature both share (`wire::version_signature`); the Go
+        /// column is that one. `-` where the signed bytes decide and differ from Go's. A
+        /// key that does not read is `kriv:kljuc` (an invalid record here), one that is not
+        /// a point `kriv:potpis`. The Rust column used `kriv:potpis` for both.
+        #[test]
+        fn envelope_author_reads_as_the_shared_author_key() {
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "vrijedi", "vrijedi"),
+                ("prazno", "kriv:kljuc", "kriv:potpis"),
+                ("samo_razmak", "kriv:kljuc", "kriv:potpis"),
+                ("nije_base64", "kriv:kljuc", "kriv:potpis"),
+                ("31B", "kriv:kljuc", "kriv:potpis"),
+                ("33B", "kriv:kljuc", "kriv:potpis"),
+                ("bez_paddinga", "kriv:kljuc", "kriv:potpis"),
+                ("visak_paddinga", "kriv:kljuc", "kriv:potpis"),
+                ("razmak_ispred", "kriv:kljuc", "vrijedi"),
+                ("razmak_iza", "kriv:kljuc", "vrijedi"),
+                ("tab_iza", "kriv:kljuc", "vrijedi"),
+                ("novi_red_ispred", "vrijedi", "vrijedi"),
+                ("novi_red_iza", "vrijedi", "vrijedi"),
+                ("crlf_iza", "vrijedi", "vrijedi"),
+                ("novi_red_u_sredini", "vrijedi", "kriv:potpis"),
+                ("visak_bitova", "vrijedi", "kriv:potpis"),
+                ("url_safe", "kriv:kljuc", "kriv:potpis"),
+                ("url_safe_kanonski", "vrijedi", "vrijedi"),
+                ("nije_tocka", "kriv:potpis", "kriv:potpis"),
+                ("identitet", "vrijedi", "vrijedi"),
+                ("identitet_nekanonski_y", "vrijedi", "vrijedi"),
+                ("identitet_s_predznakom", "vrijedi", "vrijedi"),
+                ("red2_R_identitet", "-", "vrijedi"),
+                ("red2_R_tocka", "-", "vrijedi"),
+            ];
+            assert_edges_as_in_go(&table, |edge| {
+                let mut v = SignedVersionEnvelope {
+                    version_id: "v1".into(),
+                    entity: "users".into(),
+                    entity_id: "korisnik-1".into(),
+                    node_id: "admin-1".into(),
+                    supersedes: String::new(),
+                    archived: false,
+                    channel: String::new(),
+                    created_at: "2025-10-09T08:53:20Z".into(),
+                    created_at_unix: AT,
+                    schema_version: 1,
+                    author_pub_key: edge.key.clone(),
+                    grant_ref: String::new(),
+                    payload: "{}".into(),
+                    signature: String::new(),
+                };
+                v.signature =
+                    STANDARD.encode(edge.signer.sign(&v.canonical_signing_bytes("gocop")));
+                match v.verify_signature("gocop") {
+                    Ok(_) => "vrijedi".into(),
+                    Err(TrustError::InvalidFormat(_)) => "kriv:kljuc".into(),
+                    Err(TrustError::BadSignature) => "kriv:potpis".into(),
+                    Err(e) => format!("drugo:{e}"),
+                }
+            });
+        }
+    }
+
+    mod signature_edges {
+        use super::*;
+        use crate::identity::key_edges::with_trailing_bit;
+
+        const AT: i64 = 1_760_000_000;
+
+        fn b64(vk: &VerifyingKey) -> String {
+            public_key_to_base64(vk.as_bytes())
+        }
+
+        fn net() -> SigningKey {
+            SigningKey::from_bytes(&[9; 32])
+        }
+
+        fn member() -> SigningKey {
+            SigningKey::from_bytes(&[5; 32])
+        }
+
+        fn signer() -> SigningKey {
+            SigningKey::from_bytes(&[1; 32])
+        }
+
+        /// The edges of a signature's text, built from its 64 canonical bytes, with the
+        /// same names as in the Go probe.
+        fn edges(raw: &[u8; 64]) -> Vec<(&'static str, String)> {
+            let s = STANDARD.encode(raw);
+            // s + L: the same signature with a scalar that is not reduced.
+            const L: [u8; 32] = [
+                0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+                0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+            ];
+            let mut s_plus_l = *raw;
+            let mut carry = 0u16;
+            for i in 0..32 {
+                let sum = u16::from(raw[32 + i]) + u16::from(L[i]) + carry;
+                s_plus_l[32 + i] = sum as u8;
+                carry = sum >> 8;
+            }
+            let mut high_bit = *raw;
+            high_bit[63] |= 0x80;
+            vec![
+                ("ispravno", s.clone()),
+                ("prazno", String::new()),
+                ("samo_razmak", " ".into()),
+                ("nije_base64", "nije potpis".into()),
+                ("63B", STANDARD.encode(&raw[..63])),
+                ("65B", STANDARD.encode([&raw[..], &[0]].concat())),
+                ("bez_paddinga", s.trim_end_matches('=').into()),
+                ("visak_paddinga", format!("{s}=")),
+                ("razmak_ispred", format!(" {s}")),
+                ("razmak_iza", format!("{s} ")),
+                ("tab_iza", format!("{s}\t")),
+                ("novi_red_ispred", format!("\n{s}")),
+                ("novi_red_iza", format!("{s}\n")),
+                ("crlf_iza", format!("{s}\r\n")),
+                ("novi_red_u_sredini", format!("{}\n{}", &s[..30], &s[30..])),
+                ("novi_red_u_paddingu", format!("{}\n=", &s[..s.len() - 1])),
+                ("visak_bitova", with_trailing_bit(&s)),
+                ("url_safe", s.replace('+', "-").replace('/', "_")),
+                ("nekanonski_s", STANDARD.encode(s_plus_l)),
+                ("visoki_bit", STANDARD.encode(high_bit)),
+            ]
+        }
+
+        /// Runs `outcome` over every edge of `raw` and fails with each edge where it is
+        /// not what Go gives. `table` is `(edge, Go, Rust before)`; the last column is a
+        /// record only.
+        fn assert_signature_edges_as_in_go(
+            table: &[(&str, &str, &str)],
+            raw: &[u8; 64],
+            mut outcome: impl FnMut(&str) -> String,
+        ) {
+            let edges = edges(raw);
+            let mut wrong = Vec::new();
+            for (name, text) in &edges {
+                let Some((_, go, _before)) = table.iter().find(|row| row.0 == *name) else {
+                    wrong.push(format!("{name}: no row in the table"));
+                    continue;
+                };
+                let got = outcome(text);
+                if got != *go {
+                    wrong.push(format!("{name}: Go {go}, Rust {got}"));
+                }
+            }
+            for (name, _, _) in table {
+                if !edges.iter().any(|e| e.0 == *name) {
+                    wrong.push(format!("{name}: no such edge"));
+                }
+            }
+            assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        }
+
+        fn sig_of(text: &str) -> [u8; 64] {
+            STANDARD.decode(text).unwrap().try_into().unwrap()
+        }
+
+        fn verdict(r: Result<(), TrustError>) -> String {
+            match r {
+                Ok(()) => "vrijedi".into(),
+                Err(TrustError::BadSignature) => "kriv:potpis".into(),
+                Err(e) => format!("drugo:{e}"),
+            }
+        }
+
+        /// What Go gives for a membership, an ovlast and the shared version signature
+        /// (the three read a signature the same way): Go's `base64.StdEncoding` and then
+        /// the 64 bytes of Ed25519.
+        #[rustfmt::skip]
+        const SIGNED: [(&str, &str, &str); 20] = [
+            ("ispravno", "vrijedi", "vrijedi"),
+            ("prazno", "kriv:potpis", "kriv:potpis"),
+            ("samo_razmak", "kriv:potpis", "kriv:potpis"),
+            ("nije_base64", "kriv:potpis", "kriv:potpis"),
+            ("63B", "kriv:potpis", "kriv:potpis"),
+            ("65B", "kriv:potpis", "kriv:potpis"),
+            ("bez_paddinga", "kriv:potpis", "kriv:potpis"),
+            ("visak_paddinga", "kriv:potpis", "kriv:potpis"),
+            ("razmak_ispred", "kriv:potpis", "vrijedi"),
+            ("razmak_iza", "kriv:potpis", "vrijedi"),
+            ("tab_iza", "kriv:potpis", "vrijedi"),
+            ("novi_red_ispred", "vrijedi", "vrijedi"),
+            ("novi_red_iza", "vrijedi", "vrijedi"),
+            ("crlf_iza", "vrijedi", "vrijedi"),
+            ("novi_red_u_sredini", "vrijedi", "kriv:potpis"),
+            ("novi_red_u_paddingu", "vrijedi", "kriv:potpis"),
+            ("visak_bitova", "vrijedi", "kriv:potpis"),
+            ("url_safe", "kriv:potpis", "kriv:potpis"),
+            ("nekanonski_s", "kriv:potpis", "kriv:potpis"),
+            ("visoki_bit", "kriv:potpis", "kriv:potpis"),
+        ];
+
+        /// The signature of a membership the network key signed is read as Go reads it.
+        #[test]
+        fn membership_signature_reads_as_in_go() {
+            let mut m = Membership {
+                network: b64(&net().verifying_key()),
+                device_id: "clan-1".into(),
+                device_key: b64(&member().verifying_key()),
+                issued_by: "admin-1".into(),
+                issued_at: AT,
+                expires_at: AT + 24 * 3600,
+                signature: String::new(),
+                admitter: None,
+            };
+            let raw = net().sign(&m.signed_bytes()).to_bytes();
+            // The signature Go prints for the same membership.
+            assert_eq!(
+                raw,
+                sig_of(
+                    "L7PO8Xy8U4flarX9thC28+fDPKt1qM2C/8Nr0JGaRNO7hXaS/TMbiUZ9IH/LFNW+Vz9vBt/2I9jdUf/cieexDg=="
+                )
+            );
+            assert_signature_edges_as_in_go(&SIGNED, &raw, |text| {
+                m.signature = text.into();
+                verdict(m.verify(&net().verifying_key(), &member().verifying_key(), AT + 100))
+            });
+        }
+
+        /// The signature of an ovlast is read as Go reads it.
+        #[test]
+        fn ovlast_signature_reads_as_in_go() {
+            let mut o = Ovlast {
+                network: b64(&net().verifying_key()),
+                device_id: "primatelj-1".into(),
+                device_key: b64(&signer().verifying_key()),
+                issued_by: "admin-1".into(),
+                issued_at: AT,
+                expires_at: AT + 48 * 3600,
+                signature: String::new(),
+            };
+            let raw = net().sign(&o.signed_bytes()).to_bytes();
+            assert_eq!(
+                raw,
+                sig_of(
+                    "rdUnuNOl877eDNRNe+ygVKX7y9SNs3dMBlw+Ty3BHEA4zO5e86onv4L4iMNs6zNK8itchFYSNoPOIjRP3APKBA=="
+                )
+            );
+            assert_signature_edges_as_in_go(&SIGNED, &raw, |text| {
+                o.signature = text.into();
+                verdict(o.verify(&net().verifying_key(), AT + 100))
+            });
+        }
+
+        /// The signature of a revocation is read as Go reads it, both for its id and for
+        /// the check that the signer signed it. The id is made from the edge's text, as
+        /// the one who wrote it would make it.
+        #[test]
+        fn revocation_signature_reads_as_in_go() {
+            let mut r = Revocation {
+                id: String::new(),
+                kind: "clanstvo".into(),
+                target_id: "cvor-1".into(),
+                public_key: b64(&member().verifying_key()),
+                issued_at: AT,
+                revoked_at: AT + 3600,
+                revoked_by: "admin-1".into(),
+                signer_key: b64(&signer().verifying_key()),
+                signature: String::new(),
+            };
+            let raw = signer().sign(&r.signed_bytes()).to_bytes();
+            assert_eq!(
+                raw,
+                sig_of(
+                    "ipQlrR8K+8NMe6gvXG1u90Dgi1v4AFqKvuvV/KjeVZgzH9ABguHZxBS5sAOcWysNTkBV/Wwc3gGe0VwYijWFDw=="
+                )
+            );
+            r.signature = STANDARD.encode(raw);
+            let canonical_id = r.compute_id().unwrap();
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "ispravan", "ispravan"),
+                ("prazno", "neispravan", "neispravan"),
+                ("samo_razmak", "neispravan", "neispravan"),
+                ("nije_base64", "neispravan", "neispravan"),
+                ("63B", "neispravan", "neispravan"),
+                ("65B", "neispravan", "neispravan"),
+                ("bez_paddinga", "neispravan", "neispravan"),
+                ("visak_paddinga", "neispravan", "neispravan"),
+                ("razmak_ispred", "neispravan", "neispravan"),
+                ("razmak_iza", "neispravan", "neispravan"),
+                ("tab_iza", "neispravan", "neispravan"),
+                ("novi_red_ispred", "ispravan", "neispravan"),
+                ("novi_red_iza", "ispravan", "neispravan"),
+                ("crlf_iza", "ispravan", "neispravan"),
+                ("novi_red_u_sredini", "ispravan", "neispravan"),
+                ("novi_red_u_paddingu", "ispravan", "neispravan"),
+                ("visak_bitova", "ispravan", "neispravan"),
+                ("url_safe", "neispravan", "neispravan"),
+                ("nekanonski_s", "neispravan", "neispravan"),
+                ("visoki_bit", "neispravan", "neispravan"),
+            ];
+            assert_signature_edges_as_in_go(&table, &raw, |text| {
+                r.signature = text.into();
+                r.id = r.compute_id().unwrap_or_default();
+                match r.verify_self() {
+                    Ok(_) => {
+                        // As in Go: a text that reads to the same bytes gives the same id.
+                        assert_eq!(r.id, canonical_id);
+                        "ispravan".into()
+                    }
+                    Err(_) => "neispravan".into(),
+                }
+            });
+        }
+
+        /// The older envelope reads its signature as the shared version signature is read
+        /// (the Go column is that one, over its own signed bytes).
+        #[test]
+        fn envelope_signature_reads_as_the_shared_signature() {
+            let mut v = SignedVersionEnvelope {
+                version_id: "v1".into(),
+                entity: "users".into(),
+                entity_id: "korisnik-1".into(),
+                node_id: "admin-1".into(),
+                supersedes: String::new(),
+                archived: false,
+                channel: String::new(),
+                created_at: "2025-10-09T08:53:20Z".into(),
+                created_at_unix: AT,
+                schema_version: 1,
+                author_pub_key: String::new(),
+                grant_ref: String::new(),
+                payload: "{}".into(),
+                signature: String::new(),
+            }
+            .sign("gocop", &signer());
+            let raw = sig_of(&v.signature);
+            assert_signature_edges_as_in_go(&SIGNED, &raw, |text| {
+                v.signature = text.into();
+                verdict(v.verify_signature("gocop").map(|_| ()))
+            });
+        }
     }
 }

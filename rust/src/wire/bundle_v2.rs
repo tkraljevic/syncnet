@@ -1,4 +1,4 @@
-use crate::identity::{parse_public_key, public_key_to_base64};
+use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::wire::signal::base64_bytes;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -153,8 +153,12 @@ impl ProtectedBundleV2 {
             return Err(BundleV2Error::WrongRecipient);
         }
 
-        let sender_vk = parse_public_key(&self.sender_pub_key)
+        // Read as Go reads the issuer's key of the bundle for transfer by file: a key that
+        // does not read is a bad header, one that reads but is not a point a bad signature.
+        let sender = parse_public_key_bytes(&self.sender_pub_key)
             .map_err(|e| BundleV2Error::InvalidHeader(e.to_string()))?;
+        let sender_vk = ed25519_dalek::VerifyingKey::from_bytes(&sender)
+            .map_err(|_| BundleV2Error::BadSignature)?;
         let sig_arr: [u8; 64] = self
             .signature
             .clone()
@@ -325,5 +329,101 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Seals as `seal` does, with any text in `sender_pub_key` and any signer.
+    fn seal_as(
+        sender_text: &str,
+        signer: &crate::identity::key_edges::EdgeSigner,
+        recipient: &SigningKey,
+    ) -> ProtectedBundleV2 {
+        let recipient_text = public_key_to_base64(recipient.verifying_key().as_bytes());
+        let recipient_x25519 =
+            X25519PublicKey::from(recipient.verifying_key().to_montgomery().to_bytes());
+        let eph_secret = StaticSecret::from([7u8; 32]);
+        let shared = eph_secret.diffie_hellman(&recipient_x25519);
+        let salt = [8u8; 16];
+        let nonce = [9u8; 12];
+        let key = derive_bundle_key(
+            "gocop",
+            shared.as_bytes(),
+            &salt,
+            sender_text,
+            &recipient_text,
+        );
+        let aad = canonical_aad("gocop", sender_text, &recipient_text);
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: b"sadrzaj",
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let mut bundle = ProtectedBundleV2 {
+            format_version: BUNDLE_V2_FORMAT,
+            protocol: "gocop".into(),
+            sender_pub_key: sender_text.into(),
+            recipient_pub_key: recipient_text,
+            ephemeral_x25519_pub: X25519PublicKey::from(&eph_secret).as_bytes().to_vec(),
+            salt: salt.to_vec(),
+            nonce: nonce.to_vec(),
+            ciphertext,
+            signature: Vec::new(),
+        };
+        bundle.signature = signer.sign(&bundle.signing_bytes()).to_vec();
+        bundle
+    }
+
+    /// Go does not read this bundle (version 2 of the conversation is still a sketch).
+    /// The sender's key is read as Go reads the issuer's key of the bundle for transfer by
+    /// file, and the Go column is that one: a key that does not read is a bad header, a
+    /// key that reads but is not a point is a bad signature. `-` where the signed bytes
+    /// decide and differ from Go's; there the key must still read.
+    #[test]
+    fn sender_key_reads_as_the_issuer_key_in_go() {
+        use crate::identity::key_edges::assert_edges_as_in_go;
+
+        let recipient = SigningKey::from_bytes(&[6; 32]);
+        #[rustfmt::skip]
+        let table = [
+            ("ispravno", "vrijedi", "vrijedi"),
+            ("prazno", "kriv:kljuc", "kriv:kljuc"),
+            ("samo_razmak", "kriv:kljuc", "kriv:kljuc"),
+            ("nije_base64", "kriv:kljuc", "kriv:kljuc"),
+            ("31B", "kriv:kljuc", "kriv:kljuc"),
+            ("33B", "kriv:kljuc", "kriv:kljuc"),
+            ("bez_paddinga", "kriv:kljuc", "kriv:kljuc"),
+            ("visak_paddinga", "kriv:kljuc", "kriv:kljuc"),
+            ("razmak_ispred", "kriv:kljuc", "vrijedi"),
+            ("razmak_iza", "kriv:kljuc", "vrijedi"),
+            ("tab_iza", "kriv:kljuc", "vrijedi"),
+            ("novi_red_ispred", "vrijedi", "vrijedi"),
+            ("novi_red_iza", "vrijedi", "vrijedi"),
+            ("crlf_iza", "vrijedi", "vrijedi"),
+            ("novi_red_u_sredini", "vrijedi", "kriv:kljuc"),
+            ("visak_bitova", "vrijedi", "kriv:kljuc"),
+            ("url_safe", "kriv:kljuc", "kriv:kljuc"),
+            ("url_safe_kanonski", "vrijedi", "vrijedi"),
+            ("nije_tocka", "kriv:potpis", "kriv:kljuc"),
+            ("identitet", "vrijedi", "vrijedi"),
+            ("identitet_nekanonski_y", "vrijedi", "vrijedi"),
+            ("identitet_s_predznakom", "vrijedi", "vrijedi"),
+            ("red2_R_identitet", "-", "vrijedi"),
+            ("red2_R_tocka", "-", "vrijedi"),
+        ];
+        assert_edges_as_in_go(&table, |edge| {
+            let got = match seal_as(&edge.key, &edge.signer, &recipient).open("gocop", &recipient) {
+                Ok(_) => "vrijedi".to_owned(),
+                Err(BundleV2Error::InvalidHeader(_)) => "kriv:kljuc".into(),
+                Err(BundleV2Error::BadSignature) => "kriv:potpis".into(),
+                Err(e) => format!("drugo:{e}"),
+            };
+            if edge.name.starts_with("red2") {
+                assert_ne!(got, "kriv:kljuc", "{}", edge.name);
+            }
+            got
+        });
     }
 }
