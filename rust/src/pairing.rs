@@ -5,6 +5,7 @@ use crate::{
         conversation_v1::{ConversationV1Error, read_line_bytes},
         frame::{FrameError, read_frame_async, write_frame_async},
         go_bytes,
+        go_object::{Field, Schema, go_struct},
     },
 };
 use ed25519_dalek::SigningKey;
@@ -123,7 +124,9 @@ pub struct PairHello {
     pub sas: u32,
 }
 
+/// Read as Go reads the code-agreement message (see [`crate::wire::go_object`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct SasWireMessage {
     #[serde(
         default,
@@ -138,6 +141,12 @@ pub struct SasWireMessage {
     )]
     pub broj: Option<Vec<u8>>,
 }
+
+pub(crate) const SAS_SCHEMA: Schema = Schema {
+    fields: &[Field::nullable("obveza"), Field::nullable("broj")],
+    baseline: &[],
+};
+go_struct!(SasWireMessage, SAS_SCHEMA);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairConfirm {

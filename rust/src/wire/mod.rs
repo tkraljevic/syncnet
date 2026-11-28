@@ -5,6 +5,7 @@ pub mod frame;
 pub mod go_base64;
 pub mod go_bytes;
 pub mod go_json;
+pub mod go_object;
 pub mod signal;
 pub mod vectors;
 pub mod version_signature;

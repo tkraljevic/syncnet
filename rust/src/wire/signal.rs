@@ -1,6 +1,7 @@
 use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::wire::go_bytes;
 use crate::wire::go_json::to_go_json_vec;
+use crate::wire::go_object::{Field, Kind, Schema, go_struct};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -70,19 +71,33 @@ impl std::error::Error for SignalError {}
 /// Go always writes both fields, so a missing one (e.g. the old `{"kind","addr"}` shape)
 /// is rejected instead of silently becoming an empty string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct CandidateAddr {
     pub vrsta: String,
     pub adresa: String,
 }
 
+pub(crate) const CANDIDATE_SCHEMA: Schema = Schema {
+    fields: &[Field::value("vrsta"), Field::value("adresa")],
+    baseline: &[("vrsta", "\"\""), ("adresa", "\"\"")],
+};
+go_struct!(CandidateAddr, CANDIDATE_SCHEMA);
+
 /// Sender's NAT report (`NATPoruke` in goCOP: `{"vrsta","udpBlokiran"}`, both omitted when empty).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct NatReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vrsta: String,
     #[serde(rename = "udpBlokiran", default, skip_serializing_if = "is_false")]
     pub udp_blokiran: bool,
 }
+
+pub(crate) const NAT_SCHEMA: Schema = Schema {
+    fields: &[Field::value("vrsta"), Field::value("udpBlokiran")],
+    baseline: &[],
+};
+go_struct!(NatReport, NAT_SCHEMA);
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -101,8 +116,10 @@ fn is_none_or_zero(v: &Option<u32>) -> bool {
     v.is_none_or(|n| n == 0)
 }
 
+/// Field names are read as Go reads them (see [`crate::wire::go_object`]): in any ASCII
+/// case, and a field given twice counts the last time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub struct SignalBody {
     pub ver: u32,
     pub sesija: String,
@@ -142,15 +159,54 @@ pub struct SignalBody {
     pub vj: Option<Vec<u8>>,
 }
 
+pub(crate) const BODY_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("ver"),
+        Field::value("sesija"),
+        Field::value("od"),
+        Field::value("za"),
+        Field::value("sastajaliste"),
+        Field::value("izdano"),
+        Field::nullable("tajna"),
+        Field::new("kandidati", Kind::StructSlice),
+        Field::new("nat", Kind::Struct),
+        Field::value("odluka"),
+        Field::value("razlog"),
+        Field::value("obradaMs"),
+        Field::value("pokusaj"),
+        Field::value("rttMs"),
+        Field::nullable("vj"),
+    ],
+    baseline: &[
+        ("ver", "1"),
+        ("sesija", "\"\""),
+        ("od", "\"\""),
+        ("za", "\"\""),
+        ("sastajaliste", "\"\""),
+        ("izdano", "0"),
+    ],
+};
+go_struct!(SignalBody, BODY_SCHEMA);
+
+/// Read as Go reads the signed message: field names in any ASCII case, the last of a
+/// repeated field, and a missing field as no bytes, which the checks then refuse as Go's
+/// do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct SignedSignalMessage {
     #[serde(skip)]
     pub kind: String,
-    #[serde(with = "go_bytes")]
+    #[serde(default, with = "go_bytes")]
     pub tijelo: Vec<u8>,
-    #[serde(with = "go_bytes")]
+    #[serde(default, with = "go_bytes")]
     pub potpis: Vec<u8>,
 }
+
+pub(crate) const SIGNED_SCHEMA: Schema = Schema {
+    fields: &[Field::nullable("tijelo"), Field::nullable("potpis")],
+    baseline: &[],
+};
+go_struct!(SignedSignalMessage, SIGNED_SCHEMA);
 
 pub fn signal_signing_prefix(protocol: &str, kind: &str) -> Vec<u8> {
     format!("{protocol}-{kind}-v1|").into_bytes()
