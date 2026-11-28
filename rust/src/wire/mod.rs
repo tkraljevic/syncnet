@@ -3,6 +3,7 @@ pub mod conversation;
 pub mod conversation_v1;
 pub mod frame;
 pub mod go_base64;
+pub mod go_bytes;
 pub mod go_json;
 pub mod signal;
 pub mod vectors;

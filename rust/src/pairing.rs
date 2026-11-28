@@ -4,6 +4,7 @@ use crate::{
     wire::{
         conversation_v1::{ConversationV1Error, read_line_bytes},
         frame::{FrameError, read_frame_async, write_frame_async},
+        go_bytes,
     },
 };
 use ed25519_dalek::SigningKey;
@@ -81,35 +82,6 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
-mod opt_base64 {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match bytes {
-            Some(b) => serializer.serialize_str(&STANDARD.encode(b)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        match opt {
-            Some(s) => STANDARD
-                .decode(s.trim())
-                .map(Some)
-                .map_err(|e| D::Error::custom(format!("neispravan base64 u SAS poruci: {e}"))),
-            None => Ok(None),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairIdentity {
     pub protocol: String,
@@ -153,9 +125,17 @@ pub struct PairHello {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SasWireMessage {
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_base64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "go_bytes::opt"
+    )]
     pub obveza: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_base64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "go_bytes::opt"
+    )]
     pub broj: Option<Vec<u8>>,
 }
 
@@ -1203,6 +1183,38 @@ mod tests {
             negotiate_sas_listener_async(&mut s4, "list2cart", &listener_nonce).await,
             Err(PairingError::InvalidCommit)
         ));
+    }
+
+    /// The number in a code-agreement message, 32 bytes of 0x11, written as it may come
+    /// off the wire. What Go's `json.Decoder` makes of each, measured with go1.27.1: the
+    /// same 32 bytes, an error, or nothing (`null`). Spaces and tabs at the edge used to be
+    /// trimmed here; Go refuses them.
+    #[test]
+    fn sas_number_reads_as_go_reads_bytes() {
+        let b64 = "ERERERERERERERERERERERERERERERERERERERERERE=";
+        let nums = vec!["17"; 32].join(",");
+        let cases = [
+            (format!("\"{b64}\""), "isti"),
+            (format!("\"{}F=\"", &b64[..42]), "isti"),
+            (format!("\"{}\\n{}\"", &b64[..20], &b64[20..]), "isti"),
+            (format!("[{nums}]"), "isti"),
+            (format!("\"{b64}\\n\""), "isti"),
+            (format!("\" {b64}\""), "greska"),
+            (format!("\"{b64} \""), "greska"),
+            (format!("\"{b64}\\t\""), "greska"),
+            (format!("\"\\t{b64}\""), "greska"),
+            ("null".to_owned(), "prazno"),
+        ];
+        for (value, go) in cases {
+            let wire = format!(r#"{{"broj":{value}}}"#);
+            let got = match serde_json::from_str::<SasWireMessage>(&wire) {
+                Err(_) => "greska",
+                Ok(m) if m.broj.as_deref() == Some([0x11u8; 32].as_slice()) => "isti",
+                Ok(m) if m.broj.is_none() => "prazno",
+                Ok(_) => "drugo",
+            };
+            assert_eq!(got, go, "{wire}");
+        }
     }
 
     #[test]
