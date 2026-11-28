@@ -206,6 +206,13 @@ Za članstvo koje je potpisao ovlašteni primatelj vrijedi još:
 
 Ovlast nema pričuve: ne vrijedi prije `issuedAt` ni nakon `expiresAt`.
 
+`expiresAt` s nultim vremenom `0001-01-01T00:00:00Z` (u kanonskim
+bajtovima -62135596800) znači da zapis ne ističe. Samo to vrijeme znači
+„bez isteka”: `1970-01-01` i ranija vremena znače da je zapis davno
+istekao. Članstvo bez isteka koje je izdao ovlašteni primatelj traje dulje
+od svake ovlasti koja ističe. Da je `expiresAt` prije `issuedAt`, ne
+provjerava se; takav zapis je samo istekao.
+
 Članstvo vrijedi kad: potpis vrijedi, mreža je prava, ključ računala je
 onaj koji je dokazan u TLS-u, nije opozvano i nije isteklo. Isteklo
 članstvo za razmjenu vrijedi još 30 dana pričuve, da istek sam ne raspadne
@@ -387,7 +394,9 @@ Tijelo je JSON:
 Prazna polja izostaju. Primatelj prihvaća poruku kad: potpis vrijedi,
 pošiljatelj je član, `za` je njegov ključ, `sastajaliste` je ključ
 njegova sastajališta, `izdano` nije dalje od 10 minuta od njegova sata i
-istu poruku nije već vidio.
+istu poruku nije već vidio. Tijelo mora imati i ispravan oblik: `ver` je
+najmanje 1 (veće inačice se primaju), sesija je 16 bajtova u heksu, a
+`pokusaj` je od 1 do 3 samo uz sinkro, dok izvan sinkra nije veći od 0.
 
 Sastajalište poruku prosljeđuje netaknutu i odbaci je kad `od` nije ključ
 veze s koje je stigla.
