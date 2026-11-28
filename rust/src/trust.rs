@@ -12,13 +12,97 @@ pub const OVLAST_CANONICAL_VERSION: &str = "ovlast/1";
 pub const REVOCATION_CANONICAL_VERSION: &str = "opoziv/1";
 
 /// Go's zero time (`0001-01-01T00:00:00Z`, what Go writes for a time never set) in Unix
-/// seconds. As an `expiresAt` it means no expiry, as in Go. Any other time is a time, 1970
-/// (0) and earlier ones too: Go takes them as long past.
+/// seconds. It is how no expiry is written on the wire and in the signed bytes. In code
+/// no expiry is [`Expiry::NEVER`], not this number. Any other time is a time, 1970 (0)
+/// and earlier ones too: Go takes them as long past.
 pub const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 
-/// Whether `expires_at` is a time at all, and not Go's zero time.
-fn expires(expires_at: i64) -> bool {
-    expires_at != GO_ZERO_TIME_UNIX
+/// When an ovlast or a membership stops holding (`expiresAt`).
+///
+/// On the wire and in the signed bytes `expiresAt` is a time, and only Go's zero time
+/// ([`GO_ZERO_TIME_UNIX`]) means no expiry (PROTOKOL §7). `0` is 1970 and has long
+/// passed. A bare number is not an expiry, so code that hands over `0` meaning "no
+/// expiry" does not compile:
+///
+/// ```compile_fail
+/// use syncnet::trust::verify_admitter_chain;
+/// let network = syncnet::identity::generate_signing_key().verifying_key();
+/// let now = 1_760_000_000;
+/// let _ = verify_admitter_chain(&network, None, "root", now, 0, now);
+/// ```
+///
+/// No expiry has to be said, and a time has to be said as one:
+///
+/// ```
+/// use syncnet::trust::{Expiry, verify_admitter_chain};
+/// let network = syncnet::identity::generate_signing_key().verifying_key();
+/// let now = 1_760_000_000;
+/// assert!(verify_admitter_chain(&network, None, "root", now, Expiry::NEVER, now).is_ok());
+/// assert!(Expiry::from_wire_unix(0).is_expired_at(now));
+/// assert!(!Expiry::NEVER.is_expired_at(i64::MAX));
+/// ```
+///
+/// The value is the wire's `expiresAt` and nothing else, so no expiry has one form
+/// only: [`Expiry::NEVER`] and `Expiry::from_wire_unix(GO_ZERO_TIME_UNIX)` are the same
+/// value. Read the time with [`Expiry::last_second`], which gives `None` for no expiry.
+///
+/// There is no `From<i64>` and no serde of its own: a number becomes an expiry only
+/// through [`Expiry::from_wire_unix`], and a record says how it writes one (the records
+/// here use [`rfc3339_unix::expiry`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Expiry(i64);
+
+impl Expiry {
+    /// No expiry. Written as Go's zero time.
+    pub const NEVER: Self = Self(GO_ZERO_TIME_UNIX);
+
+    /// The expiry a wire or signed `expiresAt` stands for: exactly
+    /// [`GO_ZERO_TIME_UNIX`] is no expiry, anything else is that time, 0 too (1970).
+    ///
+    /// Only for a number written as the wire writes it. A record of your own where 0
+    /// means no expiry must turn its 0 into [`Expiry::NEVER`] itself; read through here
+    /// that 0 is 1970, and a record that should have no expiry passes the admitter's
+    /// limit and holds for ever.
+    pub const fn from_wire_unix(unix: i64) -> Self {
+        Self(unix)
+    }
+
+    /// The `expiresAt` written on the wire and signed: [`GO_ZERO_TIME_UNIX`] for no
+    /// expiry. `Expiry::from_wire_unix(e.wire_unix()) == e`.
+    pub const fn wire_unix(self) -> i64 {
+        self.0
+    }
+
+    /// The last second it holds (Unix seconds), or `None` for no expiry.
+    pub const fn last_second(self) -> Option<i64> {
+        if self.0 == GO_ZERO_TIME_UNIX {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
+
+    /// Whether this is no expiry.
+    pub const fn is_never(self) -> bool {
+        self.0 == GO_ZERO_TIME_UNIX
+    }
+
+    /// Whether it has passed at `at_unix`. The expiry second itself still holds.
+    pub const fn is_expired_at(self, at_unix: i64) -> bool {
+        match self.last_second() {
+            Some(last) => at_unix > last,
+            None => false,
+        }
+    }
+}
+
+impl fmt::Debug for Expiry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.last_second() {
+            None => f.write_str("Expiry::NEVER"),
+            Some(unix) => write!(f, "Expiry({unix})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +152,8 @@ pub struct Validity {
 }
 
 impl Validity {
-    pub fn expires_at(self) -> Result<i64, TrustError> {
+    /// `issued_at + valid_for_secs`, read as the wire reads it.
+    pub fn expires_at(self) -> Result<Expiry, TrustError> {
         if self.valid_for_secs <= 0 {
             return Err(TrustError::InvalidFormat(
                 "validity duration must be positive".into(),
@@ -76,6 +161,7 @@ impl Validity {
         }
         self.issued_at
             .checked_add(self.valid_for_secs)
+            .map(Expiry::from_wire_unix)
             .ok_or_else(|| TrustError::InvalidFormat("validity expiry out of range".into()))
     }
 }
@@ -176,8 +262,8 @@ pub struct Ovlast {
     pub issued_by: String,
     #[serde(with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(with = "rfc3339_unix")]
-    pub expires_at: i64,
+    #[serde(with = "rfc3339_unix::expiry")]
+    pub expires_at: Expiry,
     pub signature: String,
 }
 
@@ -201,7 +287,7 @@ impl Ovlast {
             device_key: &self.device_key,
             issued_by: &self.issued_by,
             issued_at: self.issued_at,
-            expires_at: self.expires_at,
+            expires_at: self.expires_at.wire_unix(),
         })
         .expect("canonical ovlast serializes")
     }
@@ -214,7 +300,7 @@ impl Ovlast {
         if at_unix < self.issued_at {
             return Err(TrustError::NotYetValid);
         }
-        if expires(self.expires_at) && at_unix > self.expires_at {
+        if self.expires_at.is_expired_at(at_unix) {
             return Err(TrustError::Expired);
         }
         Ok(())
@@ -230,8 +316,8 @@ pub struct Membership {
     pub issued_by: String,
     #[serde(with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(with = "rfc3339_unix")]
-    pub expires_at: i64,
+    #[serde(with = "rfc3339_unix::expiry")]
+    pub expires_at: Expiry,
     pub signature: String,
     #[serde(
         rename = "primatelj",
@@ -264,7 +350,7 @@ impl Membership {
                 device_key: &self.device_key,
                 issued_by: &self.issued_by,
                 issued_at: self.issued_at,
-                expires_at: self.expires_at,
+                expires_at: self.expires_at.wire_unix(),
                 ovlast: &ovlast.signature,
             })
             .expect("canonical membership v2 serializes")
@@ -287,7 +373,7 @@ impl Membership {
                 device_key: &self.device_key,
                 issued_by: &self.issued_by,
                 issued_at: self.issued_at,
-                expires_at: self.expires_at,
+                expires_at: self.expires_at.wire_unix(),
             })
             .expect("canonical membership v1 serializes")
         }
@@ -305,14 +391,14 @@ impl Membership {
         if admitter_pub_b64 != ovlast.device_key {
             return Err(TrustError::UnauthorizedSigner);
         }
-        if issued_at < ovlast.issued_at
-            || (expires(ovlast.expires_at) && issued_at > ovlast.expires_at)
-        {
+        if issued_at < ovlast.issued_at || ovlast.expires_at.is_expired_at(issued_at) {
             return Err(TrustError::Expired);
         }
         let mut exp = validity.expires_at()?;
-        if expires(ovlast.expires_at) && exp > ovlast.expires_at {
-            exp = ovlast.expires_at;
+        if let Some(limit) = ovlast.expires_at.last_second()
+            && exp.last_second().is_none_or(|last| last > limit)
+        {
+            exp = Expiry::from_wire_unix(limit);
         }
         let issued_by = ovlast.device_id.clone();
         let mut m = Self {
@@ -351,7 +437,7 @@ impl Membership {
             now_unix,
         )?;
         verify_ed25519_b64(&signer, &self.signed_bytes(), &self.signature)?;
-        if expires(self.expires_at) && now_unix > self.expires_at {
+        if self.expires_at.is_expired_at(now_unix) {
             return Err(TrustError::Expired);
         }
         Ok(())
@@ -557,12 +643,18 @@ impl SignedVersionEnvelope {
 /// the ovlast (one with no expiry runs longer than any ovlast that has one), `issued_at`
 /// may run up to one hour ahead of the verifier's clock, and `issued_by` must be the
 /// ovlast's device. Go does not ask that `expires_at` come after `issued_at`.
+///
+/// `expires_at` is the record's own expiry. A record that keeps it as a number reads it
+/// with [`Expiry::from_wire_unix`] only when the number is the wire's (Go's zero time for
+/// no expiry). A record where 0 means no expiry must pass [`Expiry::NEVER`] for its 0:
+/// read as a wire number, 0 is 1970, earlier than any ovlast's limit, and the record
+/// would pass here and then never expire.
 pub fn verify_admitter_chain(
     network_pub: &VerifyingKey,
     admitter: Option<&Ovlast>,
     issued_by: &str,
     issued_at: i64,
-    expires_at: i64,
+    expires_at: Expiry,
     now_unix: i64,
 ) -> Result<VerifyingKey, TrustError> {
     let Some(ovlast) = admitter else {
@@ -571,7 +663,9 @@ pub fn verify_admitter_chain(
     ovlast
         .verify(network_pub, issued_at)
         .map_err(|e| TrustError::AdmitterOvlast(Box::new(e)))?;
-    if expires(ovlast.expires_at) && (!expires(expires_at) || expires_at > ovlast.expires_at) {
+    if let Some(limit) = ovlast.expires_at.last_second()
+        && expires_at.last_second().is_none_or(|last| last > limit)
+    {
         return Err(TrustError::ExceedsAdmitterAuthority);
     }
     if issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
@@ -694,6 +788,22 @@ pub mod rfc3339_unix {
 
     pub fn serialize<S: Serializer>(unix: &i64, ser: S) -> Result<S::Ok, S::Error> {
         ser.serialize_str(&format_utc(*unix))
+    }
+
+    /// An [`Expiry`](super::Expiry) as the wire writes it: a time, Go's zero time for no
+    /// expiry. It reads what [`rfc3339_unix::deserialize`](deserialize) reads, and
+    /// takes the number as [`Expiry::from_wire_unix`](super::Expiry::from_wire_unix) does.
+    pub mod expiry {
+        use super::super::Expiry;
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(expiry: &Expiry, ser: S) -> Result<S::Ok, S::Error> {
+            super::serialize(&expiry.wire_unix(), ser)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Expiry, D::Error> {
+            super::deserialize(de).map(Expiry::from_wire_unix)
+        }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
@@ -1188,7 +1298,7 @@ mod tests {
                 device_key: edge.key.clone(),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
-                expires_at: AT + 48 * 3600,
+                expires_at: Expiry::from_wire_unix(AT + 48 * 3600),
                 signature: String::new(),
             };
             ovlast.signature = STANDARD.encode(net.sign(&ovlast.signed_bytes()).to_bytes());
@@ -1198,7 +1308,7 @@ mod tests {
                 device_key: b64(&member().verifying_key()),
                 issued_by: "primatelj-1".into(),
                 issued_at: AT,
-                expires_at: AT + 24 * 3600,
+                expires_at: Expiry::from_wire_unix(AT + 24 * 3600),
                 signature: String::new(),
                 admitter: Some(ovlast),
             };
@@ -1551,7 +1661,7 @@ mod tests {
                 device_key: b64(&member().verifying_key()),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
-                expires_at: AT + 24 * 3600,
+                expires_at: Expiry::from_wire_unix(AT + 24 * 3600),
                 signature: String::new(),
                 admitter: None,
             };
@@ -1578,7 +1688,7 @@ mod tests {
                 device_key: b64(&signer().verifying_key()),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
-                expires_at: AT + 48 * 3600,
+                expires_at: Expiry::from_wire_unix(AT + 48 * 3600),
                 signature: String::new(),
             };
             let raw = net().sign(&o.signed_bytes()).to_bytes();
@@ -1956,7 +2066,7 @@ mod tests {
                     device_key: b64(&admitter),
                     issued_by: "admin".into(),
                     issued_at: c.o_issued.unwrap_or(AT - DAY),
-                    expires_at: c.o_expires.unwrap_or(AT + 2 * DAY),
+                    expires_at: Expiry::from_wire_unix(c.o_expires.unwrap_or(AT + 2 * DAY)),
                     signature: String::new(),
                 };
                 o.signature = signed(&net, &o.signed_bytes(), c.o_bad_signature);
@@ -1971,7 +2081,7 @@ mod tests {
                     .unwrap_or(if c.admitter { "primatelj-1" } else { "root" })
                     .into(),
                 issued_at: c.m_issued.unwrap_or(AT),
-                expires_at: c.m_expires.unwrap_or(AT + DAY),
+                expires_at: Expiry::from_wire_unix(c.m_expires.unwrap_or(AT + DAY)),
                 signature: String::new(),
                 admitter: ovlast,
             };
@@ -2150,6 +2260,263 @@ mod tests {
                 ("oznaka_prazna", "neispravan", "neispravan"),
             ];
             assert_rows_as_in_go(&table, revocation_outcome);
+        }
+    }
+
+    /// `expiresAt` as a type of its own: no expiry is said as `Expiry::NEVER`, and the
+    /// wire and the signed bytes stay as Go writes them.
+    mod expiry {
+        use super::*;
+        use crate::wire::go_json::to_go_json_string;
+
+        const AT: i64 = 1_760_000_000;
+        const DAY: i64 = 86_400;
+
+        fn key(b: u8) -> SigningKey {
+            SigningKey::from_bytes(&[b; 32])
+        }
+
+        fn b64(sk: &SigningKey) -> String {
+            public_key_to_base64(sk.verifying_key().as_bytes())
+        }
+
+        fn ovlast(expires_at: Expiry) -> Ovlast {
+            let mut o = Ovlast {
+                network: b64(&key(9)),
+                device_id: "primatelj-1".into(),
+                device_key: b64(&key(7)),
+                issued_by: "admin".into(),
+                issued_at: AT - DAY,
+                expires_at,
+                signature: String::new(),
+            };
+            o.signature = STANDARD.encode(key(9).sign(&o.signed_bytes()).to_bytes());
+            o
+        }
+
+        /// A membership for `key(5)` signed by the network key, or by the admitter when
+        /// `admitter` is given.
+        fn membership(expires_at: Expiry, admitter: Option<Ovlast>) -> Membership {
+            let signer = if admitter.is_some() { key(7) } else { key(9) };
+            let mut m = Membership {
+                network: b64(&key(9)),
+                device_id: "clan-1".into(),
+                device_key: b64(&key(5)),
+                issued_by: if admitter.is_some() {
+                    "primatelj-1"
+                } else {
+                    "root"
+                }
+                .into(),
+                issued_at: AT,
+                expires_at,
+                signature: String::new(),
+                admitter,
+            };
+            m.signature = STANDARD.encode(signer.sign(&m.signed_bytes()).to_bytes());
+            m
+        }
+
+        fn verify(m: &Membership, now: i64) -> Result<(), TrustError> {
+            m.verify(&key(9).verifying_key(), &key(5).verifying_key(), now)
+        }
+
+        #[test]
+        fn no_expiry_is_go_zero_time_in_signed_bytes_and_on_the_wire() {
+            assert_eq!(Expiry::from_wire_unix(GO_ZERO_TIME_UNIX), Expiry::NEVER);
+            assert_eq!(Expiry::NEVER.wire_unix(), GO_ZERO_TIME_UNIX);
+            assert_eq!(Expiry::NEVER.last_second(), None);
+            assert!(Expiry::NEVER.is_never());
+            assert_eq!(format!("{:?}", Expiry::NEVER), "Expiry::NEVER");
+
+            let m = membership(Expiry::NEVER, None);
+            let signed = String::from_utf8(m.signed_bytes()).unwrap();
+            assert!(
+                signed.ends_with(r#""issuedAt":1760000000,"expiresAt":-62135596800}"#),
+                "{signed}"
+            );
+            let wire = serde_json::to_string(&m).unwrap();
+            assert!(
+                wire.contains(r#""expiresAt":"0001-01-01T00:00:00Z""#),
+                "{wire}"
+            );
+
+            let back: Membership = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back.expires_at, Expiry::NEVER);
+            assert_eq!(back.signed_bytes(), m.signed_bytes());
+            assert_eq!(serde_json::to_string(&back).unwrap(), wire);
+            assert_eq!(verify(&back, i64::MAX), Ok(()));
+        }
+
+        #[test]
+        fn zero_is_1970_and_has_expired() {
+            let zero = Expiry::from_wire_unix(0);
+            assert_eq!(zero.last_second(), Some(0));
+            assert!(!zero.is_never());
+            assert!(zero.is_expired_at(1));
+            assert!(!zero.is_expired_at(0));
+            assert_eq!(format!("{zero:?}"), "Expiry(0)");
+
+            let m = membership(zero, None);
+            let signed = String::from_utf8(m.signed_bytes()).unwrap();
+            assert!(signed.ends_with(r#""expiresAt":0}"#), "{signed}");
+            let wire = serde_json::to_string(&m).unwrap();
+            assert!(
+                wire.contains(r#""expiresAt":"1970-01-01T00:00:00Z""#),
+                "{wire}"
+            );
+            assert_eq!(verify(&m, AT), Err(TrustError::Expired));
+
+            // A record that carries 0 as a number reads as 1970 too.
+            let as_number =
+                wire.replace(r#""expiresAt":"1970-01-01T00:00:00Z""#, r#""expiresAt":0"#);
+            let back: Membership = serde_json::from_str(&as_number).unwrap();
+            assert_eq!(back.expires_at, zero);
+            assert_eq!(verify(&back, AT), Err(TrustError::Expired));
+
+            let o = ovlast(zero);
+            assert_eq!(
+                o.verify(&key(9).verifying_key(), AT),
+                Err(TrustError::Expired)
+            );
+        }
+
+        /// The case behind the type: a record of its own (as an application keeps one)
+        /// where 0 means no expiry. Before, it could hand 0 on as a number; then the chain
+        /// took 0 as 1970, earlier than any ovlast, and the record held for ever. Now it
+        /// has to say `NEVER`, and that is refused.
+        #[test]
+        fn no_expiry_membership_from_expiring_admitter_is_refused() {
+            let limit = AT + 2 * DAY;
+            let expiring = ovlast(Expiry::from_wire_unix(limit));
+            let net = key(9).verifying_key();
+            let chain = |expires_at| {
+                verify_admitter_chain(&net, Some(&expiring), "primatelj-1", AT, expires_at, AT)
+            };
+            assert_eq!(
+                chain(Expiry::NEVER),
+                Err(TrustError::ExceedsAdmitterAuthority)
+            );
+            assert_eq!(
+                chain(Expiry::from_wire_unix(GO_ZERO_TIME_UNIX)),
+                Err(TrustError::ExceedsAdmitterAuthority)
+            );
+            assert_eq!(
+                chain(Expiry::from_wire_unix(limit)),
+                Ok(key(7).verifying_key())
+            );
+            assert_eq!(
+                chain(Expiry::from_wire_unix(limit + 1)),
+                Err(TrustError::ExceedsAdmitterAuthority)
+            );
+
+            let m = membership(Expiry::NEVER, Some(expiring.clone()));
+            assert_eq!(verify(&m, AT), Err(TrustError::ExceedsAdmitterAuthority));
+
+            // An ovlast with no expiry lets a membership with no expiry through.
+            let m = membership(Expiry::NEVER, Some(ovlast(Expiry::NEVER)));
+            assert_eq!(verify(&m, AT), Ok(()));
+        }
+
+        /// The admitter never issues for longer than its ovlast holds.
+        #[test]
+        fn admit_as_is_cut_to_the_ovlast() {
+            let admit = |ovlast_expiry| {
+                Membership::admit_as(
+                    &key(7),
+                    ovlast(ovlast_expiry),
+                    "clan-1",
+                    &key(5).verifying_key(),
+                    Validity {
+                        issued_at: AT,
+                        valid_for_secs: 10 * DAY,
+                    },
+                )
+                .unwrap()
+                .expires_at
+            };
+            assert_eq!(
+                admit(Expiry::from_wire_unix(AT + 2 * DAY)),
+                Expiry::from_wire_unix(AT + 2 * DAY)
+            );
+            assert_eq!(admit(Expiry::NEVER), Expiry::from_wire_unix(AT + 10 * DAY));
+        }
+
+        /// A validity is read as the wire reads its sum, as before the type: a sum that
+        /// falls exactly on Go's zero time is no expiry.
+        #[test]
+        fn validity_is_read_as_the_wire_reads_it() {
+            let validity = |issued_at, valid_for_secs| {
+                Validity {
+                    issued_at,
+                    valid_for_secs,
+                }
+                .expires_at()
+            };
+            assert_eq!(validity(AT, DAY), Ok(Expiry::from_wire_unix(AT + DAY)));
+            assert_eq!(validity(GO_ZERO_TIME_UNIX - 10, 10), Ok(Expiry::NEVER));
+            assert!(validity(i64::MAX, 1).is_err());
+            assert!(validity(AT, 0).is_err());
+        }
+
+        /// Read from the vectors and written back, every record gives Go's bytes again:
+        /// the signed bytes, the signature, and the record itself.
+        #[test]
+        fn wire_vectors_read_back_to_the_same_bytes() {
+            let v: serde_json::Value =
+                serde_json::from_str(include_str!("../../vektori/vektori-zice.json"))
+                    .expect("vektori-zice.json");
+            let net = parse_public_key(v["ulaz"]["kljucMreze"].as_str().unwrap()).unwrap();
+            let now = v["ulaz"]["vrijeme"].as_i64().unwrap();
+            let text = |path: &[&str]| {
+                path.iter()
+                    .fold(&v, |v, p| &v[*p])
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+
+            for (path, special) in [
+                (&["ovlast"][..], false),
+                (&["posebniZnakovi", "ovlast"], true),
+            ] {
+                let zapis = text(&[path, &["zapis"]].concat());
+                let o: Ovlast = serde_json::from_str(&zapis).unwrap();
+                assert!(!o.expires_at.is_never(), "{path:?}");
+                assert_eq!(
+                    String::from_utf8(o.signed_bytes()).unwrap(),
+                    text(&[path, &["bajtovi"]].concat())
+                );
+                let back = if special {
+                    to_go_json_string(&o).unwrap()
+                } else {
+                    serde_json::to_string(&o).unwrap()
+                };
+                assert_eq!(back, zapis, "{path:?}");
+                o.verify(&net, now).unwrap();
+            }
+
+            for (path, special) in [
+                (&["clanstvoKljucemMreze"][..], false),
+                (&["clanstvoOdPrimatelja"], false),
+                (&["posebniZnakovi", "clanstvo"], true),
+            ] {
+                let zapis = text(&[path, &["zapis"]].concat());
+                let m: Membership = serde_json::from_str(&zapis).unwrap();
+                assert!(!m.expires_at.is_never(), "{path:?}");
+                assert_eq!(
+                    String::from_utf8(m.signed_bytes()).unwrap(),
+                    text(&[path, &["bajtovi"]].concat())
+                );
+                let back = if special {
+                    to_go_json_string(&m).unwrap()
+                } else {
+                    serde_json::to_string(&m).unwrap()
+                };
+                assert_eq!(back, zapis, "{path:?}");
+                let device = parse_public_key(&m.device_key).unwrap();
+                m.verify(&net, &device, now).unwrap();
+            }
         }
     }
 }
