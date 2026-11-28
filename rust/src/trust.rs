@@ -11,6 +11,16 @@ pub const MAX_CLOCK_SKEW_SECS: i64 = 3600;
 pub const OVLAST_CANONICAL_VERSION: &str = "ovlast/1";
 pub const REVOCATION_CANONICAL_VERSION: &str = "opoziv/1";
 
+/// Go's zero time (`0001-01-01T00:00:00Z`, what Go writes for a time never set) in Unix
+/// seconds. As an `expiresAt` it means no expiry, as in Go. Any other time is a time, 1970
+/// (0) and earlier ones too: Go takes them as long past.
+pub const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
+
+/// Whether `expires_at` is a time at all, and not Go's zero time.
+fn expires(expires_at: i64) -> bool {
+    expires_at != GO_ZERO_TIME_UNIX
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustError {
     OtherNetwork,
@@ -22,6 +32,10 @@ pub enum TrustError {
     ExceedsAdmitterAuthority,
     IssuerMismatch,
     UnauthorizedSigner,
+    /// The admitter's ovlast does not hold at the membership's `issuedAt`: the reason the
+    /// ovlast's own check gave. Go gives the same kind here as for the other rules on the
+    /// admitter (`ExceedsAdmitterAuthority`, `IssuedInFuture`), not that of the membership.
+    AdmitterOvlast(Box<TrustError>),
     Revoked,
     InvalidFormat(String),
 }
@@ -38,6 +52,7 @@ impl fmt::Display for TrustError {
             Self::ExceedsAdmitterAuthority => write!(f, "exceeds admitter authority"),
             Self::IssuerMismatch => write!(f, "issuer mismatch"),
             Self::UnauthorizedSigner => write!(f, "unauthorized signer"),
+            Self::AdmitterOvlast(e) => write!(f, "admitter's ovlast does not hold: {e}"),
             Self::Revoked => write!(f, "revoked"),
             Self::InvalidFormat(m) => write!(f, "invalid trust record: {m}"),
         }
@@ -199,7 +214,7 @@ impl Ovlast {
         if at_unix < self.issued_at {
             return Err(TrustError::NotYetValid);
         }
-        if self.expires_at > 0 && at_unix > self.expires_at {
+        if expires(self.expires_at) && at_unix > self.expires_at {
             return Err(TrustError::Expired);
         }
         Ok(())
@@ -290,12 +305,13 @@ impl Membership {
         if admitter_pub_b64 != ovlast.device_key {
             return Err(TrustError::UnauthorizedSigner);
         }
-        if issued_at < ovlast.issued_at || (ovlast.expires_at > 0 && issued_at > ovlast.expires_at)
+        if issued_at < ovlast.issued_at
+            || (expires(ovlast.expires_at) && issued_at > ovlast.expires_at)
         {
             return Err(TrustError::Expired);
         }
         let mut exp = validity.expires_at()?;
-        if ovlast.expires_at > 0 && exp > ovlast.expires_at {
+        if expires(ovlast.expires_at) && exp > ovlast.expires_at {
             exp = ovlast.expires_at;
         }
         let issued_by = ovlast.device_id.clone();
@@ -335,7 +351,7 @@ impl Membership {
             now_unix,
         )?;
         verify_ed25519_b64(&signer, &self.signed_bytes(), &self.signature)?;
-        if self.expires_at > 0 && now_unix > self.expires_at {
+        if expires(self.expires_at) && now_unix > self.expires_at {
             return Err(TrustError::Expired);
         }
         Ok(())
@@ -433,13 +449,11 @@ impl Revocation {
     /// revoked key (`public_key`) is not read, as in Go: a revocation revokes only a key
     /// written the same (`revokes`), so one with any other text revokes nothing. Compare
     /// `public_key` only as text, as `revokes` does, never by the bytes it reads to.
+    ///
+    /// Nothing else is asked, as in Go (PROTOKOL §7: on arrival only the id and the
+    /// signature): any kind, an empty `target_id`, any times. What the revocation revokes
+    /// is for `revokes` and the caller.
     pub fn verify_self(&self) -> Result<VerifyingKey, TrustError> {
-        self.scope()?;
-        if self.target_id.is_empty() || self.issued_at < 0 || self.revoked_at < self.issued_at {
-            return Err(TrustError::InvalidFormat(
-                "invalid revocation target or timestamps".into(),
-            ));
-        }
         let signer =
             parse_public_key_bytes(&self.signer_key).map_err(|_| TrustError::BadSignature)?;
         let expected_id = self.compute_id()?;
@@ -536,6 +550,13 @@ impl SignedVersionEnvelope {
     }
 }
 
+/// The key that may sign a membership: the network key, or the admitter whose ovlast the
+/// membership carries. The rules and their order are Go's (PROTOKOL §7): they are for a
+/// membership an admitter signed only, so one the network key signed has none of them.
+/// The admitter's ovlast must hold at `issued_at`, the membership must not run longer than
+/// the ovlast (one with no expiry runs longer than any ovlast that has one), `issued_at`
+/// may run up to one hour ahead of the verifier's clock, and `issued_by` must be the
+/// ovlast's device. Go does not ask that `expires_at` come after `issued_at`.
 pub fn verify_admitter_chain(
     network_pub: &VerifyingKey,
     admitter: Option<&Ovlast>,
@@ -544,21 +565,17 @@ pub fn verify_admitter_chain(
     expires_at: i64,
     now_unix: i64,
 ) -> Result<VerifyingKey, TrustError> {
-    // PROTOKOL §7: `issuedAt` may run up to one hour ahead of the verifier's clock.
-    if issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
-        return Err(TrustError::IssuedInFuture);
-    }
-    if expires_at != 0 && expires_at < issued_at {
-        return Err(TrustError::InvalidFormat(
-            "expires_at precedes issued_at".into(),
-        ));
-    }
     let Some(ovlast) = admitter else {
         return Ok(*network_pub);
     };
-    ovlast.verify(network_pub, issued_at)?;
-    if ovlast.expires_at > 0 && (expires_at == 0 || expires_at > ovlast.expires_at) {
+    ovlast
+        .verify(network_pub, issued_at)
+        .map_err(|e| TrustError::AdmitterOvlast(Box::new(e)))?;
+    if expires(ovlast.expires_at) && (!expires(expires_at) || expires_at > ovlast.expires_at) {
         return Err(TrustError::ExceedsAdmitterAuthority);
+    }
+    if issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
+        return Err(TrustError::IssuedInFuture);
     }
     if ovlast.device_id != issued_by {
         return Err(TrustError::IssuerMismatch);
@@ -881,39 +898,25 @@ mod tests {
     }
 
     #[test]
-    fn root_signed_future_memberships_and_invalid_lifetimes_are_rejected() {
+    fn root_signed_future_memberships_hold_and_invalid_lifetimes_are_not_issued() {
         let net = NetworkKey::from_signing_key("test", generate_signing_key());
         let device = generate_signing_key().verifying_key();
         let now = 1_760_000_000;
-        let future = net
-            .admit_member(
-                "dev",
-                &device,
-                "root",
-                Validity {
-                    issued_at: now + MAX_CLOCK_SKEW_SECS + 1,
-                    valid_for_secs: 60,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            future.verify(&net.public, &device, now),
-            Err(TrustError::IssuedInFuture)
-        );
-        // Admitter's clock a few minutes fast: still within the one-hour allowance.
-        for ahead in [5, MAX_CLOCK_SKEW_SECS] {
-            let slightly_ahead = net
+        // The one-hour limit is for a membership an admitter signed (PROTOKOL §7); one the
+        // network key signed holds however far ahead it was issued, as in Go.
+        for ahead in [5, MAX_CLOCK_SKEW_SECS, MAX_CLOCK_SKEW_SECS + 1, 10 * 86_400] {
+            let ahead_of_now = net
                 .admit_member(
                     "dev",
                     &device,
                     "root",
                     Validity {
                         issued_at: now + ahead,
-                        valid_for_secs: 3600,
+                        valid_for_secs: 60,
                     },
                 )
                 .unwrap();
-            assert_eq!(slightly_ahead.verify(&net.public, &device, now), Ok(()));
+            assert_eq!(ahead_of_now.verify(&net.public, &device, now), Ok(()));
         }
         for validity in [
             Validity {
@@ -1679,6 +1682,474 @@ mod tests {
                 v.signature = text.into();
                 verdict(v.verify_signature("gocop").map(|_| ()))
             });
+        }
+    }
+
+    /// The rules on a membership, an ovlast and a revocation, and their order, as the Go
+    /// probe measured them. The Rust column is the check before: the one-hour limit for
+    /// every membership and first of all, `expiresAt` before `issuedAt` turned away, 0
+    /// (1970) taken as no expiry, an ovlast that does not hold given the membership's
+    /// kinds, and a revocation asked for a kind, a node, and times in order.
+    mod go_rules {
+        use super::*;
+        use crate::go_table::assert_rows_as_in_go;
+
+        const AT: i64 = 1_760_000_000;
+        const DAY: i64 = 86_400;
+        const Z: i64 = GO_ZERO_TIME_UNIX;
+
+        fn key(b: u8) -> SigningKey {
+            SigningKey::from_bytes(&[b; 32])
+        }
+
+        fn b64(sk: &SigningKey) -> String {
+            public_key_to_base64(sk.verifying_key().as_bytes())
+        }
+
+        /// A case; `None` is the default: an ovlast for [AT-1d, AT+2d], a membership for
+        /// [AT, AT+1d], checked at AT.
+        #[derive(Default)]
+        struct Case {
+            admitter: bool,
+            o_issued: Option<i64>,
+            o_expires: Option<i64>,
+            m_issued: Option<i64>,
+            m_expires: Option<i64>,
+            now: Option<i64>,
+            issued_by: Option<&'static str>,
+            o_other_network: bool,
+            o_bad_signature: bool,
+            m_bad_signature: bool,
+            other_network: bool,
+            other_key: bool,
+        }
+
+        fn case(name: &str) -> Case {
+            let a = Case {
+                admitter: true,
+                ..Case::default()
+            };
+            let r = Case::default();
+            match name {
+                "r_ispravno" => r,
+                "r_buducnost_1h" => Case {
+                    m_issued: Some(AT + 3600),
+                    ..r
+                },
+                "r_buducnost_1h1s" => Case {
+                    m_issued: Some(AT + 3601),
+                    ..r
+                },
+                "r_buducnost_10d" => Case {
+                    m_issued: Some(AT + 10 * DAY),
+                    m_expires: Some(AT + 20 * DAY),
+                    ..r
+                },
+                "r_istek_prije_izdanja" => Case {
+                    m_issued: Some(AT + 100),
+                    m_expires: Some(AT + 50),
+                    ..r
+                },
+                "r_istek_prije_izdanja_istekao" => Case {
+                    m_expires: Some(AT - 10),
+                    ..r
+                },
+                "r_bez_isteka" => Case {
+                    m_expires: Some(Z),
+                    ..r
+                },
+                "r_izdano_nula_bez_isteka" => Case {
+                    m_issued: Some(Z),
+                    m_expires: Some(Z),
+                    ..r
+                },
+                "r_istek_1970" => Case {
+                    m_issued: Some(0),
+                    m_expires: Some(0),
+                    ..r
+                },
+                "r_istek_1970_izdano_sad" => Case {
+                    m_expires: Some(0),
+                    ..r
+                },
+                "r_istek_negativan" => Case {
+                    m_issued: Some(-2000),
+                    m_expires: Some(-1000),
+                    ..r
+                },
+                "r_istek_tocno_sad" => Case {
+                    m_issued: Some(AT - 10),
+                    m_expires: Some(AT),
+                    ..r
+                },
+                "r_istek_sekundu_prije" => Case {
+                    m_issued: Some(AT - 10),
+                    m_expires: Some(AT - 1),
+                    ..r
+                },
+                "r_druga_mreza" => Case {
+                    other_network: true,
+                    ..r
+                },
+                "r_drugi_kljuc" => Case {
+                    other_key: true,
+                    ..r
+                },
+                "r_krivi_potpis" => Case {
+                    m_bad_signature: true,
+                    ..r
+                },
+                "r_buducnost_krivi_potpis" => Case {
+                    m_issued: Some(AT + 3601),
+                    m_bad_signature: true,
+                    ..r
+                },
+                "a_ispravno" => a,
+                "a_buducnost_1h" => Case {
+                    m_issued: Some(AT + 3600),
+                    ..a
+                },
+                "a_buducnost_1h1s" => Case {
+                    m_issued: Some(AT + 3601),
+                    ..a
+                },
+                "a_buducnost_ovlast_istekla" => Case {
+                    o_expires: Some(AT + 3600),
+                    m_issued: Some(AT + 7200),
+                    m_expires: Some(AT + 3600),
+                    ..a
+                },
+                "a_buducnost_dulje" => Case {
+                    m_issued: Some(AT + 3601),
+                    m_expires: Some(AT + 3 * DAY),
+                    ..a
+                },
+                "a_buducnost_krivi_izdavatelj" => Case {
+                    m_issued: Some(AT + 3601),
+                    issued_by: Some("netko"),
+                    ..a
+                },
+                "a_buducnost_krivi_potpis" => Case {
+                    m_issued: Some(AT + 3601),
+                    m_bad_signature: true,
+                    ..a
+                },
+                "a_buducnost_ovlast_krivi_potpis" => Case {
+                    m_issued: Some(AT + 3601),
+                    o_bad_signature: true,
+                    ..a
+                },
+                "a_istek_prije_izdanja" => Case {
+                    m_issued: Some(AT + 100),
+                    m_expires: Some(AT + 50),
+                    ..a
+                },
+                "a_istek_prije_izdanja_istekao" => Case {
+                    m_expires: Some(AT - 10),
+                    ..a
+                },
+                "a_bez_isteka" => Case {
+                    m_expires: Some(Z),
+                    ..a
+                },
+                "a_bez_isteka_ovlast_bez_isteka" => Case {
+                    o_expires: Some(Z),
+                    m_expires: Some(Z),
+                    ..a
+                },
+                "a_ovlast_bez_isteka" => Case {
+                    o_expires: Some(Z),
+                    ..a
+                },
+                "a_ovlast_istek_1970" => Case {
+                    o_issued: Some(-DAY),
+                    o_expires: Some(0),
+                    m_expires: Some(0),
+                    ..a
+                },
+                "a_ovlast_istek_1970_clanstvo_1970" => Case {
+                    o_issued: Some(-DAY),
+                    o_expires: Some(0),
+                    m_issued: Some(0),
+                    m_expires: Some(0),
+                    ..a
+                },
+                "a_clanstvo_istek_1970" => Case {
+                    m_expires: Some(0),
+                    ..a
+                },
+                "a_izdano_prije_ovlasti" => Case {
+                    m_issued: Some(AT - DAY - 1),
+                    ..a
+                },
+                "a_izdano_kad_ovlast" => Case {
+                    m_issued: Some(AT - DAY),
+                    ..a
+                },
+                "a_izdano_kad_ovlast_istjece" => Case {
+                    m_issued: Some(AT + 2 * DAY),
+                    m_expires: Some(AT + 2 * DAY),
+                    now: Some(AT + 2 * DAY),
+                    ..a
+                },
+                "a_izdano_nakon_ovlasti" => Case {
+                    m_issued: Some(AT + 2 * DAY + 1),
+                    m_expires: Some(AT + 2 * DAY + 1),
+                    now: Some(AT + 2 * DAY),
+                    ..a
+                },
+                "a_istek_kao_ovlast" => Case {
+                    m_expires: Some(AT + 2 * DAY),
+                    ..a
+                },
+                "a_istek_sekundu_dulje" => Case {
+                    m_expires: Some(AT + 2 * DAY + 1),
+                    ..a
+                },
+                "a_krivi_izdavatelj" => Case {
+                    issued_by: Some("netko"),
+                    ..a
+                },
+                "a_ovlast_druga_mreza" => Case {
+                    o_other_network: true,
+                    ..a
+                },
+                "a_ovlast_krivi_potpis" => Case {
+                    o_bad_signature: true,
+                    ..a
+                },
+                "a_clanstvo_krivi_potpis" => Case {
+                    m_bad_signature: true,
+                    ..a
+                },
+                "a_isteklo" => Case {
+                    now: Some(AT + DAY + 1),
+                    ..a
+                },
+                "a_druga_mreza" => Case {
+                    other_network: true,
+                    ..a
+                },
+                "a_drugi_kljuc" => Case {
+                    other_key: true,
+                    ..a
+                },
+                _ => panic!("no case {name}"),
+            }
+        }
+
+        fn signed(sk: &SigningKey, msg: &[u8], bad: bool) -> String {
+            let mut sig = sk.sign(msg).to_bytes();
+            if bad {
+                sig[0] ^= 1;
+            }
+            STANDARD.encode(sig)
+        }
+
+        fn membership_outcome(name: &str) -> String {
+            let c = case(name);
+            let (net, admitter, member, other) = (key(9), key(7), key(5), key(6));
+            let ovlast = c.admitter.then(|| {
+                let mut o = Ovlast {
+                    network: b64(if c.o_other_network { &other } else { &net }),
+                    device_id: "primatelj-1".into(),
+                    device_key: b64(&admitter),
+                    issued_by: "admin".into(),
+                    issued_at: c.o_issued.unwrap_or(AT - DAY),
+                    expires_at: c.o_expires.unwrap_or(AT + 2 * DAY),
+                    signature: String::new(),
+                };
+                o.signature = signed(&net, &o.signed_bytes(), c.o_bad_signature);
+                o
+            });
+            let mut m = Membership {
+                network: b64(&net),
+                device_id: "clan-1".into(),
+                device_key: b64(&member),
+                issued_by: c
+                    .issued_by
+                    .unwrap_or(if c.admitter { "primatelj-1" } else { "root" })
+                    .into(),
+                issued_at: c.m_issued.unwrap_or(AT),
+                expires_at: c.m_expires.unwrap_or(AT + DAY),
+                signature: String::new(),
+                admitter: ovlast,
+            };
+            let signer = if c.admitter { &admitter } else { &net };
+            m.signature = signed(signer, &m.signed_bytes(), c.m_bad_signature);
+            let network = if c.other_network { &other } else { &net };
+            let device = if c.other_key { &other } else { &member };
+            let got = m.verify(
+                &network.verifying_key(),
+                &device.verifying_key(),
+                c.now.unwrap_or(AT),
+            );
+            match got {
+                Ok(()) => "vrijedi".into(),
+                Err(TrustError::AdmitterOvlast(e)) => match *e {
+                    TrustError::OtherNetwork => "ovlast:mreza".into(),
+                    TrustError::BadSignature => "ovlast:potpis".into(),
+                    TrustError::NotYetValid | TrustError::Expired => "ovlast:vrijeme".into(),
+                    e => format!("ovlast:drugo:{e}"),
+                },
+                Err(TrustError::ExceedsAdmitterAuthority) => "ovlast:dulje".into(),
+                Err(TrustError::IssuedInFuture) => "ovlast:buducnost".into(),
+                Err(TrustError::IssuerMismatch) => "potpis:izdao".into(),
+                Err(TrustError::BadSignature) => "potpis".into(),
+                Err(TrustError::Expired) => "istek".into(),
+                Err(TrustError::OtherNetwork) => "mreza".into(),
+                Err(TrustError::KeyMismatch) => "kljuc".into(),
+                Err(TrustError::NotYetValid) => "nije_jos".into(),
+                Err(TrustError::InvalidFormat(_)) => "oblik".into(),
+                Err(e) => format!("drugo:{e}"),
+            }
+        }
+
+        /// Go's kinds: `ovlast:*` is the admitter's rules (Go gives one kind for all, the
+        /// part after `:` is its message), `potpis:izdao` the signature kind with the
+        /// message that names the issuer, which Rust keeps as a kind of its own.
+        #[test]
+        fn membership_chain_as_in_go() {
+            #[rustfmt::skip]
+            let table = [
+                ("r_ispravno", "vrijedi", "vrijedi"),
+                ("r_buducnost_1h", "vrijedi", "vrijedi"),
+                ("r_buducnost_1h1s", "vrijedi", "ovlast:buducnost"),
+                ("r_buducnost_10d", "vrijedi", "ovlast:buducnost"),
+                ("r_istek_prije_izdanja", "vrijedi", "oblik"),
+                ("r_istek_prije_izdanja_istekao", "istek", "oblik"),
+                ("r_bez_isteka", "vrijedi", "oblik"),
+                ("r_izdano_nula_bez_isteka", "vrijedi", "vrijedi"),
+                ("r_istek_1970", "istek", "vrijedi"),
+                ("r_istek_1970_izdano_sad", "istek", "vrijedi"),
+                ("r_istek_negativan", "istek", "vrijedi"),
+                ("r_istek_tocno_sad", "vrijedi", "vrijedi"),
+                ("r_istek_sekundu_prije", "istek", "istek"),
+                ("r_druga_mreza", "mreza", "mreza"),
+                ("r_drugi_kljuc", "kljuc", "kljuc"),
+                ("r_krivi_potpis", "potpis", "potpis"),
+                ("r_buducnost_krivi_potpis", "potpis", "ovlast:buducnost"),
+                ("a_ispravno", "vrijedi", "vrijedi"),
+                ("a_buducnost_1h", "vrijedi", "vrijedi"),
+                ("a_buducnost_1h1s", "ovlast:buducnost", "ovlast:buducnost"),
+                ("a_buducnost_ovlast_istekla", "ovlast:vrijeme", "ovlast:buducnost"),
+                ("a_buducnost_dulje", "ovlast:dulje", "ovlast:buducnost"),
+                ("a_buducnost_krivi_izdavatelj", "ovlast:buducnost", "ovlast:buducnost"),
+                ("a_buducnost_krivi_potpis", "ovlast:buducnost", "ovlast:buducnost"),
+                ("a_buducnost_ovlast_krivi_potpis", "ovlast:potpis", "ovlast:buducnost"),
+                ("a_istek_prije_izdanja", "vrijedi", "oblik"),
+                ("a_istek_prije_izdanja_istekao", "istek", "oblik"),
+                ("a_bez_isteka", "ovlast:dulje", "oblik"),
+                ("a_bez_isteka_ovlast_bez_isteka", "vrijedi", "oblik"),
+                ("a_ovlast_bez_isteka", "vrijedi", "vrijedi"),
+                ("a_ovlast_istek_1970", "ovlast:vrijeme", "vrijedi"),
+                ("a_ovlast_istek_1970_clanstvo_1970", "istek", "vrijedi"),
+                ("a_clanstvo_istek_1970", "istek", "ovlast:dulje"),
+                ("a_izdano_prije_ovlasti", "ovlast:vrijeme", "nije_jos"),
+                ("a_izdano_kad_ovlast", "vrijedi", "vrijedi"),
+                ("a_izdano_kad_ovlast_istjece", "vrijedi", "vrijedi"),
+                ("a_izdano_nakon_ovlasti", "ovlast:vrijeme", "istek"),
+                ("a_istek_kao_ovlast", "vrijedi", "vrijedi"),
+                ("a_istek_sekundu_dulje", "ovlast:dulje", "ovlast:dulje"),
+                ("a_krivi_izdavatelj", "potpis:izdao", "potpis:izdao"),
+                ("a_ovlast_druga_mreza", "ovlast:mreza", "mreza"),
+                ("a_ovlast_krivi_potpis", "ovlast:potpis", "potpis"),
+                ("a_clanstvo_krivi_potpis", "potpis", "potpis"),
+                ("a_isteklo", "istek", "istek"),
+                ("a_druga_mreza", "mreza", "mreza"),
+                ("a_drugi_kljuc", "kljuc", "kljuc"),
+            ];
+            assert_rows_as_in_go(&table, membership_outcome);
+        }
+
+        /// Go writes no expiry as its zero time, and Rust reads that text as
+        /// `GO_ZERO_TIME_UNIX` and writes it back the same.
+        #[test]
+        fn go_zero_time_is_no_expiry() {
+            assert_eq!(
+                rfc3339_unix::parse_utc("0001-01-01T00:00:00Z"),
+                Ok(GO_ZERO_TIME_UNIX)
+            );
+            assert_eq!(
+                rfc3339_unix::format_utc(GO_ZERO_TIME_UNIX),
+                "0001-01-01T00:00:00Z"
+            );
+        }
+
+        fn revocation_outcome(name: &str) -> String {
+            let net = key(9);
+            let mut r = Revocation {
+                id: String::new(),
+                kind: "clanstvo".into(),
+                target_id: "cvor-1".into(),
+                public_key: b64(&key(5)),
+                issued_at: AT,
+                revoked_at: AT + 3600,
+                revoked_by: "admin-1".into(),
+                signer_key: String::new(),
+                signature: String::new(),
+            };
+            match name {
+                "ispravno" | "oznaka_druga" | "oznaka_prazna" => {}
+                "vrsta_prazna" => r.kind = String::new(),
+                "vrsta_razmak" => r.kind = " ".into(),
+                "vrsta_nepoznata" => r.kind = "nesto".into(),
+                "cvor_prazan" => r.target_id = String::new(),
+                "kljuc_prazan" => r.public_key = String::new(),
+                "izdano_negativno" => r.issued_at = -1,
+                "izdano_nula_go" => r.issued_at = Z,
+                "izdano_1970" => r.issued_at = 0,
+                "opozvano_prije_izdanja" => r.revoked_at = AT - 1,
+                "opozvano_nula_go" => r.revoked_at = Z,
+                "opozvao_prazan" => r.revoked_by = String::new(),
+                "sve_prazno" => {
+                    r = Revocation {
+                        id: String::new(),
+                        kind: String::new(),
+                        target_id: String::new(),
+                        public_key: String::new(),
+                        issued_at: Z,
+                        revoked_at: Z,
+                        revoked_by: String::new(),
+                        signer_key: String::new(),
+                        signature: String::new(),
+                    }
+                }
+                _ => panic!("no case {name}"),
+            }
+            let mut r = r.sign(&net);
+            match name {
+                "oznaka_druga" => r.id.push('x'),
+                "oznaka_prazna" => r.id.clear(),
+                _ => {}
+            }
+            match r.verify_self() {
+                Ok(_) => "ispravan".into(),
+                Err(_) => "neispravan".into(),
+            }
+        }
+
+        #[test]
+        fn revocation_on_its_own_as_in_go() {
+            #[rustfmt::skip]
+            let table = [
+                ("ispravno", "ispravan", "ispravan"),
+                ("vrsta_prazna", "ispravan", "neispravan"),
+                ("vrsta_razmak", "ispravan", "neispravan"),
+                ("vrsta_nepoznata", "ispravan", "ispravan"),
+                ("cvor_prazan", "ispravan", "neispravan"),
+                ("kljuc_prazan", "ispravan", "ispravan"),
+                ("izdano_negativno", "ispravan", "neispravan"),
+                ("izdano_nula_go", "ispravan", "neispravan"),
+                ("izdano_1970", "ispravan", "ispravan"),
+                ("opozvano_prije_izdanja", "ispravan", "neispravan"),
+                ("opozvano_nula_go", "ispravan", "neispravan"),
+                ("opozvao_prazan", "ispravan", "ispravan"),
+                ("sve_prazno", "ispravan", "neispravan"),
+                ("oznaka_druga", "neispravan", "neispravan"),
+                ("oznaka_prazna", "neispravan", "neispravan"),
+            ];
+            assert_rows_as_in_go(&table, revocation_outcome);
         }
     }
 }

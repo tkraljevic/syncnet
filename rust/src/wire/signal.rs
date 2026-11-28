@@ -11,7 +11,7 @@ pub const SIGNAL_KIND_ODZIV: &str = "odziv";
 pub const SIGNAL_KIND_SINKRO: &str = "sinkro";
 pub const SIGNAL_MAX_SKEW_SECS: i64 = 600;
 pub const SIGNAL_REPLAY_CACHE_MAX: usize = 8192;
-pub const SIGNAL_MAX_SINKRO_ATTEMPT: u32 = 3;
+pub const SIGNAL_MAX_SINKRO_ATTEMPT: i64 = 3;
 
 pub mod base64_bytes {
     use super::*;
@@ -122,14 +122,28 @@ fn is_none_or_empty_str(v: &Option<String>) -> bool {
     v.as_ref().is_none_or(|s| s.is_empty())
 }
 
-fn is_none_or_zero(v: &Option<u32>) -> bool {
+fn is_none_or_zero(v: &Option<i64>) -> bool {
     v.is_none_or(|n| n == 0)
+}
+
+/// Go reads a missing `ver` and a `null` one as 0 (`null` leaves a Go `int` as it is), so
+/// such a body is turned away by the shape check after the signature, as in Go, and not
+/// already when it is read.
+fn go_int_or_zero<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalBody {
-    pub ver: u32,
+    /// Numbers are Go `int`, 64 bits on 64-bit platforms (a 32-bit Go build would already
+    /// refuse values past 2^31 when it reads them): Go reads any of them, negative ones
+    /// too, and only the checks after the signature say which it takes.
+    #[serde(default, deserialize_with = "go_int_or_zero")]
+    pub ver: i64,
     pub sesija: String,
     /// The sender's key as the message carries it. Several texts read to the same key
     /// (`\n` anywhere, extra bits in the last character, as in Go), so to compare, map,
@@ -154,11 +168,11 @@ pub struct SignalBody {
     #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
     pub razlog: Option<String>,
     #[serde(default, skip_serializing_if = "is_none_or_zero")]
-    pub obrada_ms: Option<u32>,
+    pub obrada_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "is_none_or_zero")]
-    pub pokusaj: Option<u32>,
+    pub pokusaj: Option<i64>,
     #[serde(default, skip_serializing_if = "is_none_or_zero")]
-    pub rtt_ms: Option<u32>,
+    pub rtt_ms: Option<i64>,
     #[serde(
         default,
         with = "opt_base64_bytes",
@@ -288,7 +302,11 @@ where
         .map_err(|_| SignalError::InvalidShape("neispravna sesija".into()))?;
     let attempt = body.pokusaj.unwrap_or(0);
     let is_sinkro = msg.kind == SIGNAL_KIND_SINKRO;
-    if body.ver != 1
+    // As in Go: `ver` from 1 up, so a later version still reads (PROTOKOL 8.4 lists no
+    // other rule). A negative attempt outside sinkro passes as in Go. Go checks the kind
+    // before this check, where it ignores a kind it does not know (PROTOKOL 8.4); Rust has
+    // no such step in front, so it is checked here.
+    if body.ver < 1
         || !matches!(
             msg.kind.as_str(),
             SIGNAL_KIND_POZIV | SIGNAL_KIND_ODZIV | SIGNAL_KIND_SINKRO
@@ -537,5 +555,195 @@ mod tests {
                 Err(e) => format!("drugo:{e}"),
             }
         });
+    }
+
+    /// The shape check after the signature, as the Go probe measured it on bodies written
+    /// by hand: `ver` from 1 up, numbers as Go `int`, a missing or `null` `ver` turned away
+    /// only after the signature. The Rust column is the check before: `ver` exactly 1 and
+    /// numbers read as `u32`, so a body Go reads could fail already when it was read.
+    #[test]
+    fn body_shape_as_in_go() {
+        let sender = SigningKey::from_bytes(&[1; 32]);
+        let me = SigningKey::from_bytes(&[3; 32]);
+        let rendezvous = SigningKey::from_bytes(&[4; 32]);
+        let other = SigningKey::from_bytes(&[6; 32]);
+        let at = 1_760_000_000i64;
+        let b64 = |k: &SigningKey| public_key_to_base64(k.verifying_key().as_bytes());
+
+        // (kind, `ver` first or none, fields after `izdano`, bad signature, other recipient)
+        let case = |name: &str| -> (&'static str, Option<&'static str>, &'static str, bool, bool) {
+            let p = SIGNAL_KIND_POZIV;
+            let s = SIGNAL_KIND_SINKRO;
+            match name {
+                "ver_1" => (p, Some("1"), "", false, false),
+                "ver_0" => (p, Some("0"), "", false, false),
+                "ver_2" => (p, Some("2"), "", false, false),
+                "ver_3" => (p, Some("3"), "", false, false),
+                "ver_-1" => (p, Some("-1"), "", false, false),
+                "ver_2^31" => (p, Some("2147483648"), "", false, false),
+                "ver_2^32" => (p, Some("4294967296"), "", false, false),
+                "ver_i64_max" => (p, Some("9223372036854775807"), "", false, false),
+                "ver_i64_max+1" => (p, Some("9223372036854775808"), "", false, false),
+                "ver_bez" => (p, None, "", false, false),
+                "ver_null" => (p, Some("null"), "", false, false),
+                "ver_tekst" => (p, Some("\"1\""), "", false, false),
+                "ver_1.0" => (p, Some("1.0"), "", false, false),
+                "ver_1e0" => (p, Some("1e0"), "", false, false),
+                "ver_2_sinkro" => (s, Some("2"), r#","pokusaj":1"#, false, false),
+                "ver_0_krivi_potpis" => (p, Some("0"), "", true, false),
+                "ver_bez_krivi_potpis" => (p, None, "", true, false),
+                "ver_null_krivi_potpis" => (p, Some("null"), "", true, false),
+                "ver_-1_krivi_potpis" => (p, Some("-1"), "", true, false),
+                "ver_2^32_drugi_za" => (p, Some("4294967296"), "", false, true),
+                "ver_0_drugi_za" => (p, Some("0"), "", false, true),
+                "poziv_pokusaj_-1" => (p, Some("1"), r#","pokusaj":-1"#, false, false),
+                "poziv_pokusaj_0" => (p, Some("1"), r#","pokusaj":0"#, false, false),
+                "poziv_pokusaj_1" => (p, Some("1"), r#","pokusaj":1"#, false, false),
+                "poziv_pokusaj_-2^32" => (p, Some("1"), r#","pokusaj":-4294967296"#, false, false),
+                "sinkro_pokusaj_bez" => (s, Some("1"), "", false, false),
+                "sinkro_pokusaj_0" => (s, Some("1"), r#","pokusaj":0"#, false, false),
+                "sinkro_pokusaj_-1" => (s, Some("1"), r#","pokusaj":-1"#, false, false),
+                "sinkro_pokusaj_1" => (s, Some("1"), r#","pokusaj":1"#, false, false),
+                "sinkro_pokusaj_3" => (s, Some("1"), r#","pokusaj":3"#, false, false),
+                "sinkro_pokusaj_4" => (s, Some("1"), r#","pokusaj":4"#, false, false),
+                "sinkro_pokusaj_2^32+1" => (s, Some("1"), r#","pokusaj":4294967297"#, false, false),
+                "obradaMs_-1" => (
+                    SIGNAL_KIND_ODZIV,
+                    Some("1"),
+                    r#","obradaMs":-1"#,
+                    false,
+                    false,
+                ),
+                "rttMs_-1" => (s, Some("1"), r#","pokusaj":1,"rttMs":-1"#, false, false),
+                "vrsta_nepoznata" => ("nepoznata", Some("1"), "", false, false),
+                "vrsta_Poziv" => ("Poziv", Some("1"), "", false, false),
+                "vrsta_prazna" => ("", Some("1"), "", false, false),
+                _ => panic!("no case {name}"),
+            }
+        };
+        let message = |kind: &str, ver: Option<&str>, rest: &str, bad: bool, other_za: bool| {
+            let za = if other_za { b64(&other) } else { b64(&me) };
+            let ver = ver.map(|v| format!(r#""ver":{v},"#)).unwrap_or_default();
+            let tijelo = format!(
+                r#"{{{ver}"sesija":"00112233445566778899aabbccddeeff","od":"{}","za":"{za}","sastajaliste":"{}","izdano":{at}{rest}}}"#,
+                b64(&sender),
+                b64(&rendezvous),
+            )
+            .into_bytes();
+            let mut signed = signal_signing_prefix("gocop", kind);
+            signed.extend_from_slice(&tijelo);
+            let mut potpis = sender.sign(&signed).to_bytes().to_vec();
+            if bad {
+                potpis[0] ^= 1;
+            }
+            SignedSignalMessage {
+                kind: kind.into(),
+                tijelo,
+                potpis,
+            }
+        };
+        let verdict = |r: Result<SignalBody, SignalError>| match r {
+            Ok(_) => "prima".to_owned(),
+            Err(SignalError::InvalidShape(_)) => "oblik".into(),
+            Err(SignalError::BadSignature) => "potpis".into(),
+            Err(SignalError::UnknownSender) => "nepoznat".into(),
+            Err(SignalError::WrongRecipient) => "za".into(),
+            Err(SignalError::WrongRendezvous) => "sastajaliste".into(),
+            Err(SignalError::ClockSkew) => "vrijeme".into(),
+            Err(SignalError::Replayed) => "ponovljena".into(),
+            Err(SignalError::ReplayCacheFull) => "puna".into(),
+        };
+        let check = |msg: &SignedSignalMessage, cache: &mut ReplayCache| {
+            verify_signed_signal(
+                "gocop",
+                msg,
+                &me.verifying_key(),
+                &rendezvous.verifying_key(),
+                at,
+                cache,
+                |_, _| true,
+            )
+        };
+
+        // Go checks the kind before this check and ignores a kind it does not know, so its
+        // own check takes any kind (the probe: `prima`). Rust checks it here: `-`.
+        #[rustfmt::skip]
+        let table = [
+            ("ver_1", "prima", "prima"),
+            ("ver_0", "oblik", "oblik"),
+            ("ver_2", "prima", "oblik"),
+            ("ver_3", "prima", "oblik"),
+            ("ver_-1", "oblik", "oblik"),
+            ("ver_2^31", "prima", "oblik"),
+            ("ver_2^32", "prima", "oblik"),
+            ("ver_i64_max", "prima", "oblik"),
+            ("ver_i64_max+1", "oblik", "oblik"),
+            ("ver_bez", "oblik", "oblik"),
+            ("ver_null", "oblik", "oblik"),
+            ("ver_tekst", "oblik", "oblik"),
+            ("ver_1.0", "oblik", "oblik"),
+            ("ver_1e0", "oblik", "oblik"),
+            ("ver_2_sinkro", "prima", "oblik"),
+            ("ver_0_krivi_potpis", "potpis", "potpis"),
+            ("ver_bez_krivi_potpis", "potpis", "oblik"),
+            ("ver_null_krivi_potpis", "potpis", "oblik"),
+            ("ver_-1_krivi_potpis", "potpis", "oblik"),
+            ("ver_2^32_drugi_za", "za", "oblik"),
+            ("ver_0_drugi_za", "za", "za"),
+            ("poziv_pokusaj_-1", "prima", "oblik"),
+            ("poziv_pokusaj_0", "prima", "prima"),
+            ("poziv_pokusaj_1", "oblik", "oblik"),
+            ("poziv_pokusaj_-2^32", "prima", "oblik"),
+            ("sinkro_pokusaj_bez", "oblik", "oblik"),
+            ("sinkro_pokusaj_0", "oblik", "oblik"),
+            ("sinkro_pokusaj_-1", "oblik", "oblik"),
+            ("sinkro_pokusaj_1", "prima", "prima"),
+            ("sinkro_pokusaj_3", "prima", "prima"),
+            ("sinkro_pokusaj_4", "oblik", "oblik"),
+            ("sinkro_pokusaj_2^32+1", "oblik", "oblik"),
+            ("obradaMs_-1", "prima", "oblik"),
+            ("rttMs_-1", "prima", "oblik"),
+            ("vrsta_nepoznata", "-", "oblik"),
+            ("vrsta_Poziv", "-", "oblik"),
+            ("vrsta_prazna", "-", "oblik"),
+        ];
+        crate::go_table::assert_rows_as_in_go(&table, |name| {
+            let (kind, ver, rest, bad, other_za) = case(name);
+            let got = verdict(check(
+                &message(kind, ver, rest, bad, other_za),
+                &mut ReplayCache::default(),
+            ));
+            if name.starts_with("vrsta_") {
+                assert_eq!(
+                    got, "oblik",
+                    "{name}: Rust turns away a kind it does not know"
+                );
+            }
+            got
+        });
+
+        // Go keys the replay cache by the attempt as written: 0 and -1 are two messages.
+        let mut cache = ReplayCache::default();
+        let first = verdict(check(
+            &message(
+                SIGNAL_KIND_POZIV,
+                Some("1"),
+                r#","pokusaj":0"#,
+                false,
+                false,
+            ),
+            &mut cache,
+        ));
+        let second = verdict(check(
+            &message(
+                SIGNAL_KIND_POZIV,
+                Some("1"),
+                r#","pokusaj":-1"#,
+                false,
+                false,
+            ),
+            &mut cache,
+        ));
+        assert_eq!((first.as_str(), second.as_str()), ("prima", "prima"));
     }
 }
