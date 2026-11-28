@@ -6,8 +6,9 @@ koja iz istog ulaza dobije iste bajtove govori istu žicu.
 Vektore je izradio kod programa iz kojeg syncnet nastaje, 18. 11. 2026.
 Dopunjeni su 26. 11. 2026. iz istog programa: potpis verzije, paket za
 prijenos datotekom i primanje na daljinu. Stari vektori pritom nisu
-promijenjeni. Isto vrijedi za dopunu od 28. 11. 2026.: kod uparivanja s
-vodećom nulom (`uparivanje.kodSNulom`).
+promijenjeni. Isto vrijedi za dvije dopune od 28. 11. 2026.: kod
+uparivanja s vodećom nulom (`uparivanje.kodSNulom`) te rubovi potpisa
+verzije i još dvije potpisane verzije (`potpisVerzije`).
 Ed25519 potpis i zapis JSON-a za isti ulaz daju isti izlaz, pa se vektori
 izrađuju ponovljivo: izrađeni su dvaput i oba puta su bili isti.
 
@@ -61,11 +62,33 @@ kod `7KQ4-M2XD`.
 - `posebniZnakovi`: ovlast, članstvo i odbijenica s imenom `a<b>&c`, te
   odbijenica s razlogom koji nosi U+2028 i U+2029;
 - `potpisVerzije`: verzija iz knjige koju potpiše njezin autor, računalo
-  A. Za svaku od dvije verzije tu su podaci kako stoje u knjizi (`ulaz`),
-  sadržaj kako ide žicom (`oblikSadrzaja`), njegov SHA-256 (`sadrzaj`),
-  bajtovi koji se potpisuju, ključ autora i potpis. Druga verzija ima
-  sadržaj s razmacima, sa znakovima `<`, `>` i `&` i s U+2028, vrijeme s
-  dijelovima sekunde i druge vrijednosti ostalih polja.
+  A. Za svaku verziju tu su podaci kako stoje u knjizi (`ulaz`), sadržaj
+  kako ide žicom (`oblikSadrzaja`), njegov SHA-256 (`sadrzaj`), bajtovi
+  koji se potpisuju, ključ autora i potpis. Verzije su:
+  - `obicna`;
+  - `posebniZnakovi`: sadržaj s razmacima, sa znakovima `<`, `>` i `&` i
+    s U+2028, vrijeme s dijelovima sekunde i druge vrijednosti ostalih
+    polja;
+  - `sadrzajSBrojevimaIBijegovima`: sadržaj s razmacima, s brojevima
+    `1.0` i `1e2` i s bijegovima `\u0041`, `\/` i `\u003C` (veliko C). U
+    obliku sadržaja sve to ostaje kako je napisano. Izvedba koja broj
+    zapiše drukčije ili bijeg razriješi dobije drugi sažetak i drugi
+    potpis;
+  - `razdjelnikUPoljima`: U+2028 u `entity_id` i u kanalu. U bajtovima
+    koji se potpisuju piše se kao `\u2028`.
+
+  Uz njih je `rubovi`: tablica nad verzijom `obicna`. Svaki redak ima
+  `opis`, `potpis` i `kljuc_autora` kako stoje uz verziju i `ishod`:
+  `nepotpisana` (oba polja prazna), `kriv` ili `vrijedi`. Ishod je izračunao
+  program iz kojeg syncnet nastaje, svojom provjerom potpisa verzije.
+  Redovi pokrivaju samo jedno od dvaju polja, prazno polje uz drugo s
+  razmakom ili novim retkom, ključ i potpis s razmakom ili tabom ispred ili
+  iza, s novim retkom (`\n` ili `\r\n`) iza, u sredini ili u dopuni, bez
+  dopune i s viškom dopune, s viškom bitova u zadnjem znaku, u abecedi za
+  URL, prekratke i predugačke. Uz to ključ potpisan nad drugim zapisom
+  istih bajtova (redovi `_stari_potpis`), ključ od 32 bajta koji nije
+  točka krivulje, točku identiteta u tri zapisa, potpis s nesvedenim `s`
+  (`s + L`) i potpis s postavljenim najvišim bitom.
 
 ## vektori-razgovora.json
 
@@ -98,6 +121,8 @@ poimence, s razlogom, u `rust/src/wire/vectors.rs`. Danas su to: vanjska
 poruka signala i puls, dogovor oznaka mogućnosti, paket za prijenos
 datotekom i primanje na daljinu.
 
+Svi redovi tablice rubova potpisa verzije u Rustu daju ishod iz Goa.
+
 ## Znakovi <, > i &
 
 U JSON-u se znakovi `<`, `>` i `&` u tekstu pišu kao `\u003c`, `\u003e` i
@@ -119,3 +144,9 @@ Isto vrijedi za U+2028 i U+2029, koji se pišu kao `\u2028` i `\u2029`.
 STUN, QUIC sesiju i njezin kontrolni kanal, poruke `odziv` i `sinkro`,
 prijavu kod sastajališta i kopiju ključa mreže. Cijeli certifikat nije
 vektor, jer mu serijski broj i rok ovise o satu.
+
+Kod potpisa verzije vektori pokazuju bajtove i ishod same provjere
+potpisa. Ne pokrivaju potpisan redak paketa ni odluke primatelja koje
+ovise o knjizi i članstvima: ključ koji nije vezan uz `node_id`, članstvo
+koje stiže u istoj delti, strože pravilo za nepotpisanu verziju od
+računala s oznakom `potpis-verzije/1` i dopunu.
