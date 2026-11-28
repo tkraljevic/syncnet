@@ -328,25 +328,30 @@ mod tests {
             text(&v, &["uparivanje", "kod"])
         );
 
-        // Same keys and caller number, and a listener number whose code starts with a
-        // zero: the code is six digits with leading zeros.
-        let listener_zero: [u8; SAS_NONCE_LEN] =
-            from_hex(&v, &["uparivanje", "kodSNulom", "brojPozvanog"]);
-        let code_zero = text(&v, &["uparivanje", "kodSNulom", "kod"]);
-        assert!(
-            code_zero.len() == 6 && code_zero.starts_with('0'),
-            "vector kodSNulom must be six digits starting with 0, got {code_zero:?}"
-        );
-        assert_eq!(
-            compute_sas_code(
-                protocol,
-                &public(&key(&v, "sjemeA")),
-                &public(&key(&v, "sjemeB")),
-                &caller,
-                &listener_zero,
-            ),
-            code_zero
-        );
+        // Same keys and caller number, other listener numbers. kodSNulom: the code
+        // starts with a zero, so it is written with leading zeros. kodSNajvisimBitom:
+        // the first byte of the digest is 0x80 or more, so reading the first four
+        // bytes as a signed number gives another code.
+        for (name, leading_zero) in [("kodSNulom", true), ("kodSNajvisimBitom", false)] {
+            let listener_other: [u8; SAS_NONCE_LEN] =
+                from_hex(&v, &["uparivanje", name, "brojSlusalice"]);
+            let code = text(&v, &["uparivanje", name, "kod"]);
+            assert!(
+                code.len() == 6 && code.starts_with('0') == leading_zero,
+                "vector {name} has an unexpected code {code:?}"
+            );
+            assert_eq!(
+                compute_sas_code(
+                    protocol,
+                    &public(&key(&v, "sjemeA")),
+                    &public(&key(&v, "sjemeB")),
+                    &caller,
+                    &listener_other,
+                ),
+                code,
+                "{name}"
+            );
+        }
     }
 
     #[test]
