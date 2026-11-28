@@ -6,8 +6,9 @@ koja iz istog ulaza dobije iste bajtove govori istu žicu.
 Vektore je izradio kod programa iz kojeg syncnet nastaje, 18. 11. 2026.
 Dopunjeni su 26. 11. 2026. iz istog programa: potpis verzije, paket za
 prijenos datotekom i primanje na daljinu. Stari vektori pritom nisu
-promijenjeni. Isto vrijedi za dopunu od 28. 11. 2026.: kod uparivanja s
-vodećom nulom (`uparivanje.kodSNulom`).
+promijenjeni. Isto vrijedi za dopunu od 28. 11. 2026.: dva koda
+uparivanja za druge brojeve pozvanog (`uparivanje.kodSNulom` i
+`uparivanje.kodSNajvisimBitom`).
 Ed25519 potpis i zapis JSON-a za isti ulaz daju isti izlaz, pa se vektori
 izrađuju ponovljivo: izrađeni su dvaput i oba puta su bili isti.
 
@@ -21,6 +22,7 @@ izrađuju ponovljivo: izrađeni su dvaput i oba puta su bili isti.
 | Tajna poziva, tajna odziva | 32 bajta `0xAA`, 32 bajta `0xBB` |
 | Broj pozivatelja, broj pozvanog | bajtovi `0x00…0x1f`, `0x80…0x9f` |
 | Broj pozvanog za `kodSNulom` | bajt `0x80` pa 31 bajt `0x00` |
+| Broj pozvanog za `kodSNajvisimBitom` | bajt `0x80`, 30 bajtova `0x00`, bajt `0x03` |
 | Ime protokola | `gocop` |
 | Oznaka vjerodajnica | `gocop:vjerodajnice:` |
 
@@ -43,9 +45,12 @@ kod `7KQ4-M2XD`.
 - ALPN za signal, WEB sync i probu;
 - tekst probe pronalaženja i odgovor na nju;
 - uparivanje: `Hello`, obveza, poruke obveze i broja, kod od šest
-  znamenki, `Confirm`. Uz to `kodSNulom`: kod za drugi broj pozvanog
-  (vidi stalni ulaz), koji počinje nulom (`020062`). Izvedba koja kod
-  piše bez vodećih nula na njemu padne;
+  znamenki, `Confirm`. Uz to dva koda za druge brojeve pozvanog (vidi
+  stalni ulaz, polje `brojSlusalice`). `kodSNulom` počinje nulom
+  (`020062`): izvedba koja kod piše bez vodećih nula na njemu padne.
+  `kodSNajvisimBitom` (`562166`) ima sažetak koji počinje bajtom `0xc5`:
+  izvedba koja prva četiri bajta čita kao broj s predznakom na njemu
+  padne;
 - kanonski bajtovi, potpis i cijeli zapis za ovlast, članstvo potpisano
   ključem mreže, članstvo potpisano od ovlaštenog primatelja i opoziv;
   oznaka opoziva;

@@ -136,6 +136,8 @@ jedan za drugim.
    dijeljenju s 1 000 000 i piše sa šest znamenki, s vodećim nulama.
    Ispitni vektor `uparivanje.kodSNulom` daje kod koji počinje nulom
    (`020062`). Izvedba koja kod piše bez vodećih nula na njemu padne.
+   Vektor `uparivanje.kodSNajvisimBitom` ima sažetak koji počinje bajtom
+   `0xc5`, pa na njemu padne izvedba koja broj čita s predznakom.
 4. Oba čovjeka usporede kod i potvrde. Svaka strana pošalje
    `Confirm`: `{"approved": true|false, "payload": …}`. Ništa se ne sprema
    dok obje strane ne potvrde.
