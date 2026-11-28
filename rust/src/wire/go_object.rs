@@ -7,7 +7,9 @@
 //!
 //! - a key names a field when the two are equal without regard to ASCII case; `K`
 //!   (U+212A) also stands for `k` and `ſ` (U+017F) for `s`. Nothing else folds: `ı` and
-//!   `İ` are not `i`. A key that names no field is skipped.
+//!   `İ` are not `i`. A key that names no field is skipped. Go looks for the exact name
+//!   first, but both name the same field, so only the order counts: of `pokusaj` and
+//!   `POKUSAJ` the later one wins.
 //! - when a field comes more than once, the last one counts, and each one must still
 //!   read as the field's type;
 //! - `null` leaves a number, string or bool as it was, and clears bytes, a pointer or a
@@ -16,12 +18,12 @@
 //!   add up; a `null` between them starts again;
 //! - `null` in place of the whole object leaves every field as it was.
 //!
-//! A slice of structs given twice is the one place that needs care: Go reads the second
-//! array into the elements of the first, so a field missing from a new element keeps the
-//! old element's value. Here the last array counts on its own. That is the same as Go
-//! only because the element struct must carry every field (a missing one is refused), so
-//! a new element leaves nothing of the old one; a [`Kind::StructSlice`] field must keep
-//! it that way.
+//! - a slice of structs given more than once is read into the same elements: element `i`
+//!   of a later array is read into element `i` as it was, so a field the new element
+//!   leaves out keeps its old value, and a `null` element leaves it whole. An element
+//!   the later array does not reach stays under the slice and comes back when a still
+//!   later array is long enough. `null` or `[]` in place of the array starts again.
+//!   The slice is as long as the last array.
 //!
 //! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and [`go_struct!`]
 //! puts this reader in front of it: keys are mapped to field names, repeats are settled,
@@ -40,8 +42,8 @@ pub enum Kind {
     Nullable,
     /// A pointer to a struct: objects add up, `null` clears it.
     Struct,
-    /// A slice of structs whose element struct requires all its fields: the last array
-    /// counts, `null` clears it.
+    /// A slice of structs: arrays are read into the same elements, `null` and `[]` clear
+    /// it.
     StructSlice,
 }
 
@@ -178,7 +180,7 @@ fn settle<T>(
                 .map(|v| v.get().to_owned()),
             Kind::Nullable => values.last().map(|v| v.get().to_owned()),
             Kind::Struct => merged(values)?,
-            Kind::StructSlice => last_slice(values),
+            Kind::StructSlice => merged_slice(values)?,
         };
         if let Some(raw) = last {
             push_entry(&mut out, field.name, &raw);
@@ -234,13 +236,48 @@ fn merged(values: &[&RawValue]) -> Result<Option<String>, String> {
     }
 }
 
-/// A slice of structs: the last array counts (see the module notes on why that is Go's
-/// result). A last `null` leaves the field out, so it reads as empty, as Go's nil slice.
-fn last_slice(values: &[&RawValue]) -> Option<String> {
-    values
-        .last()
-        .filter(|v| !is_null(v))
-        .map(|v| v.get().to_owned())
+/// A slice of structs, as Go reads one array after another into the same slice: element
+/// `i` of each array adds its fields to element `i` (see the module notes). Go keeps the
+/// elements past the end of a shorter array in the slice's backing array, and a longer
+/// array later reads into them again; the backing array is never shorter than the longest
+/// array since the last `null` or `[]`, so here it is that list of elements. The slice is
+/// as long as the last array; a last `null` or `[]` leaves the field out, so it reads as
+/// empty, as Go's nil or empty slice.
+fn merged_slice(values: &[&RawValue]) -> Result<Option<String>, String> {
+    let mut backing: Vec<Entries> = Vec::new();
+    let mut len = 0;
+    for v in values {
+        let elements: Vec<Box<RawValue>> = if is_null(v) {
+            Vec::new()
+        } else {
+            serde_json::from_str(v.get()).map_err(|e| e.to_string())?
+        };
+        if elements.is_empty() {
+            backing.clear();
+        }
+        for (i, element) in elements.iter().enumerate() {
+            if i == backing.len() {
+                backing.push(Vec::new());
+            }
+            backing[i].extend(entries_of(element.get())?);
+        }
+        len = elements.len();
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+    let elements: Vec<String> = backing[..len]
+        .iter()
+        .map(|entries| {
+            let mut out = String::from("{");
+            for (k, raw) in entries {
+                push_entry(&mut out, k, raw.get());
+            }
+            out.push('}');
+            out
+        })
+        .collect();
+    Ok(Some(format!("[{}]", elements.join(","))))
 }
 
 /// Serialize and Deserialize for a struct derived with `#[serde(remote = "Self")]`:
@@ -698,9 +735,8 @@ mod tests {
         ("tp", r#","nat":5,"nat":null"#, "GRESKA", "isto"),
         ("tp", r#","nat":null"#, "~", "isto"),
         ("tp", r#","nat":{}"#, "~nat=/false", "isto"),
-        // Signal body: candidates. Go reads a second array into the first one's elements;
-        // with every field given that is the second array alone. A new element without
-        // `vrsta` would keep the old one's in Go, and Rust refuses it (see `CandidateAddr`).
+        // Signal body: candidates. Go reads a second array into the first one's elements,
+        // so a field a new element leaves out keeps the old value, and Rust does the same.
         (
             "tp",
             r#","kandidati":[{"vrsta":"javna","adresa":"1"}]"#,
@@ -713,19 +749,19 @@ mod tests {
             "tp",
             r#","kandidati":[{"vrsta":"javna","adresa":"1"}],"kandidati":[{"adresa":"2"}]"#,
             "~kand=[javna/2]",
-            "GRESKA",
+            "isto",
         ),
         (
             "tp",
             r#","kandidati":[{"vrsta":"javna","adresa":"1"},{"vrsta":"lokalna","adresa":"3"}],"kandidati":[{"adresa":"2"}]"#,
             "~kand=[javna/2]",
-            "GRESKA",
+            "isto",
         ),
         (
             "tp",
             r#","kandidati":[{"vrsta":"javna","adresa":"1"}],"kandidati":[{"adresa":"2"},{"adresa":"4"}]"#,
             "~kand=[javna/2;/4]",
-            "GRESKA",
+            "isto",
         ),
         (
             "tp",
@@ -783,19 +819,70 @@ mod tests {
         ),
         ("tp", r#","kandidati":5,"kandidati":null"#, "GRESKA", "isto"),
         ("tp", r#","kandidati":{}"#, "GRESKA", "isto"),
-        // A candidate without both fields: Rust asks for both (see `CandidateAddr`).
+        // A candidate without both fields reads as empty strings, as in Go.
         (
             "tp",
             r#","kandidati":[{"adresa":"1"}]"#,
             "~kand=[/1]",
-            "GRESKA",
+            "isto",
         ),
-        ("tp", r#","kandidati":[null]"#, "~kand=[/]", "GRESKA"),
+        ("tp", r#","kandidati":[null]"#, "~kand=[/]", "isto"),
         (
             "tp",
             r#","kandidati":[{"vrsta":"a","adresa":"1"},null]"#,
             "~kand=[a/1;/]",
+            "isto",
+        ),
+        // Elements a shorter array does not reach come back with a longer one; `null` and
+        // `[]` start again.
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"},{"vrsta":"c","adresa":"y"}],"kandidati":[{"vrsta":"b"}],"kandidati":[{"vrsta":"d"},{"vrsta":"e"}]"#,
+            "~kand=[d/x;e/y]",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"},{"vrsta":"c","adresa":"y"},{"vrsta":"f","adresa":"z"}],"kandidati":[],"kandidati":[{},{},{},{}]"#,
+            "~kand=[/;/;/;/]",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"}],"kandidati":null,"kandidati":[{"vrsta":"b"}]"#,
+            "~kand=[b/]",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"}],"kandidati":[null]"#,
+            "~kand=[a/x]",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"}],"KANDIDATI":[{"vrsta":null,"ADRESA":"q"}]"#,
+            "~kand=[a/q]",
+            "isto",
+        ),
+        ("tp", r#","kandidati":[{"vrsta":1}]"#, "GRESKA", "isto"),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"}],"kandidati":[5]"#,
             "GRESKA",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"a","adresa":"x"}],"kandidati":[{"vrsta":"b","adresa":"y"},{"vrsta":5}],"kandidati":[]"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"kind":"javna","addr":"203.0.113.7:4242"}]"#,
+            "~kand=[/]",
+            "isto",
         ),
         // Signal body: whole texts. A missing or `null` required field Rust still refuses
         // when it reads the body; Go reads it as empty and refuses the message later.
@@ -923,7 +1010,7 @@ mod tests {
             };
             assert_eq!(got, want, "{kind} {text}");
         }
-        assert_eq!(refused, 8);
+        assert_eq!(refused, 2);
     }
 
     /// The smallest object of each schema must read, or a repeated value would be

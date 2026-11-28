@@ -10,6 +10,10 @@ use std::fmt;
 pub const MAX_CLOCK_SKEW_SECS: i64 = 3600;
 pub const OVLAST_CANONICAL_VERSION: &str = "ovlast/1";
 pub const REVOCATION_CANONICAL_VERSION: &str = "opoziv/1";
+/// The kind (`vrsta`) of a revocation that revokes a membership.
+pub const REVOCATION_KIND_MEMBERSHIP: &str = "clanstvo";
+/// The kind (`vrsta`) of a revocation that revokes an ovlast.
+pub const REVOCATION_KIND_OVLAST: &str = "ovlast";
 
 /// Go's zero time (`0001-01-01T00:00:00Z`, what Go writes for a time never set) in Unix
 /// seconds. It is how no expiry is written on the wire and in the signed bytes. In code
@@ -465,15 +469,28 @@ pub struct Revocation {
     pub signature: String,
 }
 
+/// What a revocation revokes, after its kind (`vrsta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationScope<'a> {
+    /// Exactly [`REVOCATION_KIND_MEMBERSHIP`].
+    Membership,
+    /// Exactly [`REVOCATION_KIND_OVLAST`].
+    Ovlast,
+    /// Any other kind, as written: one the application gives its own meaning, or one
+    /// that revokes nothing.
+    Other(&'a str),
+}
+
 impl Revocation {
-    pub fn scope(&self) -> Result<&str, TrustError> {
-        let trimmed = self.kind.trim();
-        if trimmed.is_empty() {
-            return Err(TrustError::InvalidFormat("empty revocation kind".into()));
-        }
-        match trimmed {
-            "clanstvo" | "membership" => Ok("membership"),
-            other => Ok(other),
+    /// The kind is compared as written, as Go compares it: only `clanstvo` revokes a
+    /// membership and only `ovlast` an ovlast. ` clanstvo`, `Clanstvo` or `membership`
+    /// revoke neither (measured in Go); such a revocation can still be valid on its own
+    /// (`verify_self`), it just revokes nothing Go knows.
+    pub fn scope(&self) -> RevocationScope<'_> {
+        match self.kind.as_str() {
+            REVOCATION_KIND_MEMBERSHIP => RevocationScope::Membership,
+            REVOCATION_KIND_OVLAST => RevocationScope::Ovlast,
+            other => RevocationScope::Other(other),
         }
     }
 
@@ -561,7 +578,7 @@ impl Revocation {
     /// carried: Go reads a key with `\n` in it or with extra bits in its last character as
     /// the same key, so a record's own text can differ from the one the revocation names.
     pub fn revokes(&self, subject_pub_b64: &str, issued_at: i64) -> bool {
-        self.scope() == Ok("membership")
+        self.scope() == RevocationScope::Membership
             && self.public_key == subject_pub_b64
             && issued_at <= self.issued_at
     }
@@ -919,6 +936,59 @@ mod tests {
             !app_rev.revokes(&public_key_to_base64(member_vk.as_bytes()), mem.issued_at),
             "an app-specific revocation does not revoke a device key"
         );
+    }
+
+    /// Which kind revokes what, as the Go probe measured it: a revocation of each kind,
+    /// signed by the network key, received as another member's version. Go compares the
+    /// kind as written, so only `clanstvo` takes the membership away and only `ovlast`
+    /// the ovlast; every one of them is valid on its own. The third column is Rust
+    /// before, when the kind was trimmed and `membership` stood for `clanstvo`.
+    #[test]
+    fn revocation_kind_as_in_go() {
+        let net_sk = SigningKey::from_bytes(&[11; 32]);
+        let member = SigningKey::from_bytes(&[12; 32]).verifying_key();
+        let member_b64 = public_key_to_base64(member.as_bytes());
+        let issued_at = 1_760_000_000i64;
+        #[rustfmt::skip]
+        let table = [
+            ("clanstvo", "clanstvo", "clanstvo"),
+            (" clanstvo", "nista", "clanstvo"),
+            ("clanstvo ", "nista", "clanstvo"),
+            ("clanstvo\n", "nista", "clanstvo"),
+            ("Clanstvo", "nista", "nista"),
+            ("CLANSTVO", "nista", "nista"),
+            ("membership", "nista", "clanstvo"),
+            ("ovlast", "ovlast", "ovlast"),
+            ("Ovlast", "nista", "nista"),
+            (" ovlast", "nista", "ovlast"),
+            ("", "nista", "greska"),
+            ("list_grant", "nista", "nista"),
+            ("clanstvo:", "nista", "nista"),
+        ];
+        crate::go_table::assert_rows_as_in_go(&table, |kind| {
+            let rev = Revocation {
+                id: String::new(),
+                kind: kind.to_owned(),
+                target_id: "clan-1".to_owned(),
+                public_key: member_b64.clone(),
+                issued_at: issued_at + 2,
+                revoked_at: issued_at + 2,
+                revoked_by: "cvor-a".to_owned(),
+                signer_key: String::new(),
+                signature: String::new(),
+            }
+            .sign(&net_sk);
+            assert_eq!(rev.verify_self(), Ok(net_sk.verifying_key()), "{kind:?}");
+            match (rev.revokes(&member_b64, issued_at), rev.scope()) {
+                (true, RevocationScope::Membership) => "clanstvo".to_owned(),
+                (false, RevocationScope::Ovlast) => "ovlast".into(),
+                (false, RevocationScope::Other(k)) => {
+                    assert_eq!(k, kind);
+                    "nista".into()
+                }
+                other => panic!("{kind:?}: {other:?}"),
+            }
+        });
     }
 
     #[test]
