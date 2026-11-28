@@ -20,17 +20,20 @@
 //! raw. serde skips and keeps such values at any depth, so the depth is checked here
 //! ([`from_slice`], and each field in [`crate::wire::go_object`]).
 //!
-//! Go keeps a `json.RawMessage` as it came, escapes and all. Text is therefore not
-//! rewritten as a whole, only where a field reads it as text
-//! ([`crate::wire::go_object`]), and a raw field is left as it is.
+//! Go keeps a `json.RawMessage` as it came, escapes and all, and bytes that are not
+//! UTF-8 as they are. Text is therefore not rewritten as a whole, only where a field reads
+//! it as text ([`crate::wire::go_object`]), and a raw field is left as it is
+//! ([`crate::wire::go_raw::RawJson`]). For that, [`from_slice`] marks each byte that is not
+//! UTF-8 instead of turning it into U+FFFD at once: a field read as text turns the mark into
+//! U+FFFD, a raw field back into the byte.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 
 /// Bytes from the wire as JSON text, each byte that is not UTF-8 turned into U+FFFD as
-/// Go turns it. Text that is UTF-8 comes back as it is.
+/// Go turns it in a text. Text that is UTF-8 comes back as it is.
 ///
-/// A raw field (`json.RawMessage`) is the one place this differs from Go: Go keeps such
-/// bytes in it, and a `str` cannot hold them.
+/// A raw field (`json.RawMessage`) keeps such bytes in Go; [`from_slice`] keeps them too.
 pub fn utf8(bytes: &[u8]) -> Cow<'_, str> {
     let mut rest = bytes;
     let mut out = String::new();
@@ -92,13 +95,212 @@ pub(crate) fn check_depth(json: &str, extra: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads `T` from bytes from the wire, as [`serde_json::from_slice`] would after Go's
-/// reading of bytes that are not UTF-8 ([`utf8`]), and refuses text nested deeper than
-/// Go reads ([`MAX_DEPTH`]).
-pub fn from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
-    let text = utf8(bytes);
+/// Reads `T` from bytes from the wire as Go reads them, and refuses text nested deeper
+/// than Go reads ([`MAX_DEPTH`]).
+///
+/// A byte that is not UTF-8 reads as U+FFFD in a text and stays the byte in a raw field, as
+/// in Go. While `T` is read each such byte is a mark (one character of the private use area,
+/// see [`MARK`]), and a character of that range in the text is written after [`MARK`]; the
+/// readers of [`crate::wire::go_object`] and [`crate::wire::go_raw::RawJson`] turn the
+/// marks back. `T` must therefore read its text through them ([`GoRead`]): serde's own
+/// derive would see the marks. Text that is UTF-8 has no marks.
+pub fn from_slice<T: GoRead>(bytes: &[u8]) -> serde_json::Result<T> {
+    let (text, marked) = match std::str::from_utf8(bytes) {
+        Ok(text) => (Cow::Borrowed(text), false),
+        Err(_) => (Cow::Owned(mark(bytes)), true),
+    };
+    let _mode = Marking::enter(marked);
     check_depth(&text, 0).map_err(<serde_json::Error as serde::de::Error>::custom)?;
     serde_json::from_str(&text)
+}
+
+/// A type that reads its text as Go does, through [`crate::wire::go_object`] or
+/// [`crate::wire::go_raw::RawJson`], and so may be read by [`from_slice`]. Every wire struct
+/// of this crate is one. A type with serde's own derive is not: where the bytes are not
+/// UTF-8 it would see the marks, so read it with `serde_json::from_slice`, which refuses
+/// such bytes.
+pub trait GoRead: serde::de::DeserializeOwned {}
+
+impl GoRead for crate::wire::go_raw::RawJson {}
+impl<T: GoRead> GoRead for Option<T> {}
+
+/// The first character of the marks: a byte `b` that is not UTF-8 is the character
+/// `MARK + b` (U+E080 to U+E0FF, three bytes, as long as the U+FFFD Go reads there), and a
+/// character from U+E000 to U+E0FF that the text has is written after `MARK`.
+pub const MARK: char = '\u{E000}';
+
+/// Whether `c` is one of the characters the marks use (U+E000 to U+E0FF).
+fn in_mark_range(c: char) -> bool {
+    ('\u{E000}'..='\u{E0FF}').contains(&c)
+}
+
+thread_local! {
+    static MARKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While it lives, text being read has marks (`true`) or none; dropping it restores what
+/// was before, so a text read inside another keeps its own mode.
+struct Marking(bool);
+
+impl Marking {
+    fn enter(on: bool) -> Self {
+        Self(MARKING.with(|m| m.replace(on)))
+    }
+}
+
+impl Drop for Marking {
+    fn drop(&mut self) {
+        MARKING.with(|m| m.set(self.0));
+    }
+}
+
+/// Whether the text being read has marks ([`from_slice`] of bytes that are not UTF-8).
+pub(crate) fn marking() -> bool {
+    MARKING.with(Cell::get)
+}
+
+/// The good part of `rest` and the byte that is not UTF-8 after it, if any.
+fn split_bad(rest: &[u8]) -> (&str, Option<u8>) {
+    match std::str::from_utf8(rest) {
+        Ok(tail) => (tail, None),
+        Err(e) => {
+            let (good, bad) = rest.split_at(e.valid_up_to());
+            (
+                std::str::from_utf8(good).expect("checked up to here"),
+                Some(bad[0]),
+            )
+        }
+    }
+}
+
+/// Bytes as text with marks, as [`from_slice`] reads them; also for writing raw JSON that
+/// is not UTF-8 ([`crate::wire::go_json`]).
+pub(crate) fn mark(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(marked_len(bytes));
+    let mut rest = bytes;
+    loop {
+        let (good, bad) = split_bad(rest);
+        if good.chars().any(in_mark_range) {
+            for c in good.chars() {
+                if in_mark_range(c) {
+                    out.push(MARK);
+                }
+                out.push(c);
+            }
+        } else {
+            out.push_str(good);
+        }
+        let Some(b) = bad else {
+            return out;
+        };
+        out.push(byte_mark(b));
+        rest = &rest[good.len() + 1..];
+    }
+}
+
+/// The mark of a byte that is not UTF-8 (always 0x80 or more).
+fn byte_mark(b: u8) -> char {
+    char::from_u32(u32::from(MARK) + u32::from(b)).expect("in the private use area")
+}
+
+/// How long [`mark`] makes `bytes`.
+fn marked_len(bytes: &[u8]) -> usize {
+    let mut len = 0;
+    let mut rest = bytes;
+    loop {
+        let (good, bad) = split_bad(rest);
+        len += good.len() + good.chars().filter(|&c| in_mark_range(c)).count() * MARK.len_utf8();
+        if bad.is_none() {
+            return len;
+        }
+        len += MARK.len_utf8();
+        rest = &rest[good.len() + 1..];
+    }
+}
+
+/// Undoes the marks of text being read: `byte` gives what a mark stands for.
+fn unmark<'a>(text: &'a str, byte: impl Fn(u8, &mut Vec<u8>)) -> Cow<'a, [u8]> {
+    if !marking() {
+        return Cow::Borrowed(text.as_bytes());
+    }
+    unmark_always(text, byte)
+}
+
+fn unmark_always<'a>(text: &'a str, byte: impl Fn(u8, &mut Vec<u8>)) -> Cow<'a, [u8]> {
+    let Some(first) = text.find(in_mark_range) else {
+        return Cow::Borrowed(text.as_bytes());
+    };
+    let mut out = Vec::with_capacity(text.len());
+    out.extend_from_slice(&text.as_bytes()[..first]);
+    let mut chars = text[first..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_mark_range(c) {
+            let mut buf = [0; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        let code = u32::from(c) - u32::from(MARK);
+        if c == MARK
+            && let Some(&next) = chars.peek()
+            && in_mark_range(next)
+        {
+            // A character of the range that the text has.
+            chars.next();
+            let mut buf = [0; 4];
+            out.extend_from_slice(next.encode_utf8(&mut buf).as_bytes());
+        } else if code >= 0x80 {
+            byte(u8::try_from(code).expect("below 0x100"), &mut out);
+        } else {
+            // Marks are made only as written in `mark`; anything else stays as it is.
+            let mut buf = [0; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Text with marks made by [`mark`], as the bytes it stands for.
+pub(crate) fn unmark_raw(text: &str) -> Cow<'_, [u8]> {
+    unmark_always(text, |b, out| out.push(b))
+}
+
+/// A raw value's text as the bytes that came: each mark is its byte again.
+pub(crate) fn raw_bytes(text: &str) -> Cow<'_, [u8]> {
+    unmark(text, |b, out| out.push(b))
+}
+
+/// One JSON value (its text) as Go reads its strings: each mark is U+FFFD, and so is each
+/// lone surrogate escape ([`lone_surrogates`]).
+pub(crate) fn as_text(text: &str) -> Cow<'_, str> {
+    match unmark(text, |_, out| out.extend_from_slice("\u{FFFD}".as_bytes())) {
+        Cow::Borrowed(_) => lone_surrogates(text),
+        Cow::Owned(b) => {
+            let t = String::from_utf8(b).expect("marks undo to UTF-8");
+            let fixed = match lone_surrogates(&t) {
+                Cow::Owned(fixed) => Some(fixed),
+                Cow::Borrowed(_) => None,
+            };
+            Cow::Owned(fixed.unwrap_or(t))
+        }
+    }
+}
+
+/// A key or text read from marked text and written again into text that is read on: the
+/// characters of the marks' range in it are written as escapes, so they are not taken for
+/// marks.
+pub(crate) fn escape_mark(json: String) -> String {
+    if !marking() || !json.contains(in_mark_range) {
+        return json;
+    }
+    let mut out = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        if in_mark_range(c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn hex4(b: &[u8]) -> Option<u16> {
@@ -183,15 +385,13 @@ mod tests {
     #[test]
     fn bytes_read_as_in_go() {
         for (content, go) in BYTES {
-            let mut text = b"{\"a\":\"".to_vec();
+            // A struct read as Go reads it (here the NAT report of a signal): its text
+            // fields turn the marks into U+FFFD.
+            let mut text = b"{\"vrsta\":\"".to_vec();
             text.extend_from_slice(content);
             text.extend_from_slice(b"\"}");
-            #[derive(serde::Deserialize)]
-            struct A {
-                a: String,
-            }
-            let a: A = super::from_slice(&text).unwrap();
-            assert_eq!(hex::encode(a.a), *go, "{content:?}");
+            let a: crate::wire::signal::NatReport = super::from_slice(&text).unwrap();
+            assert_eq!(hex::encode(a.vrsta), *go, "{content:?}");
         }
         assert!(matches!(utf8(b"{\"a\":1}"), std::borrow::Cow::Borrowed(_)));
         // Outside a string such a byte stays an error, as in Go.
@@ -201,7 +401,7 @@ mod tests {
             b"{\xff}",
             b"{\"a\":\xff}",
         ] {
-            assert!(super::from_slice::<serde_json::Value>(bad).is_err());
+            assert!(super::from_slice::<crate::wire::signal::NatReport>(bad).is_err());
         }
     }
 
@@ -227,6 +427,24 @@ mod tests {
         (r"\udbff\udfff", "f48fbfbf"),
         (r"\ude00\ud83d", "efbfbdefbfbd"),
     ];
+
+    /// Marks are as long as the U+FFFD Go reads for a byte (three bytes), and give the bytes
+    /// back, also where the text has characters of the marks' range.
+    #[test]
+    fn marks_give_the_bytes_back() {
+        for bytes in [
+            &b"\xff"[..],
+            b"a\xffb\xfe",
+            "\u{E000}\u{E0FF}\u{E080}\u{E07F}\u{E100}".as_bytes(),
+            b"\xee\x80\x80\xff\xee\x83\xbf\x80\xee\x82",
+            b"\xed\xa0\x80\xc0\xaf\xf4\x90\x80\x80",
+        ] {
+            let marked = super::mark(bytes);
+            assert_eq!(super::unmark_raw(&marked), bytes, "{bytes:?}");
+            assert_eq!(marked.len(), super::marked_len(bytes), "{bytes:?}");
+        }
+        assert_eq!(super::mark(&[0xff; 100]).len(), 300);
+    }
 
     #[test]
     fn escapes_read_as_in_go() {
@@ -278,11 +496,8 @@ mod tests {
 
     #[test]
     fn text_nested_deeper_than_go_reads_is_refused() {
-        #[derive(serde::Deserialize)]
-        struct A {
-            #[allow(dead_code)]
-            a: i64,
-        }
+        // A struct read as Go reads it, which skips `a` and `zz`.
+        type A = crate::wire::signal::NatReport;
         assert_eq!(MAX_DEPTH, 10_000);
         for (whole, go) in DEPTHS {
             let n = whole - 1;

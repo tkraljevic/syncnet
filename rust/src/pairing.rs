@@ -5,7 +5,9 @@ use crate::{
         conversation_v1::{ConversationV1Error, read_line_bytes},
         frame::{FrameError, read_frame_async, write_frame_async},
         go_bytes,
-        go_object::{Field, Schema, go_struct, object_only},
+        go_json::to_go_json_vec,
+        go_object::{self, Field, Kind, Schema, go_struct},
+        go_raw::{RawJson, keep_null},
         go_text,
     },
 };
@@ -29,7 +31,7 @@ use tokio::{
 use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream};
 
 pub const SAS_NONCE_LEN: usize = 32;
-pub const SAS_VERSION: u32 = 2;
+pub const SAS_VERSION: i64 = 2;
 pub const MAX_HELLO_LEN: usize = 64 * 1024;
 pub const MAX_SAS_MSG_LEN: usize = 4 * 1024;
 pub const MAX_CONFIRM_LEN: usize = 1024 * 1024;
@@ -80,7 +82,7 @@ pub fn compute_sas_code(
     format!("{n:06}")
 }
 
-fn is_zero_u32(v: &u32) -> bool {
+fn is_zero(v: &i64) -> bool {
     *v == 0
 }
 
@@ -112,19 +114,42 @@ impl PairIdentity {
     }
 }
 
+/// Read as Go reads its hello (see [`crate::wire::go_object`]): any field may be missing
+/// (empty), and `sas` is Go's `int`, any 64-bit integer. What is checked after reading
+/// (protocol, `sas`) is checked as in Go.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(remote = "Self")]
 pub struct PairHello {
+    #[serde(default)]
     pub protocol: String,
-    #[serde(rename = "deviceId")]
+    #[serde(rename = "deviceId", default)]
     pub device_id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub version: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "go_object::map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub meta: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub sas: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sas: i64,
 }
+
+const HELLO_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("protocol"),
+        Field::value("deviceId"),
+        Field::value("name"),
+        Field::value("version"),
+        Field::new("meta", Kind::Map),
+        Field::int("sas"),
+    ],
+    baseline: &[],
+};
+go_struct!(PairHello, HELLO_SCHEMA);
 
 /// Read as Go reads the code-agreement message (see [`crate::wire::go_object`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -145,26 +170,38 @@ pub struct SasWireMessage {
 }
 
 pub(crate) const SAS_SCHEMA: Schema = Schema {
-    fields: &[Field::nullable("obveza"), Field::nullable("broj")],
+    fields: &[Field::bytes("obveza"), Field::bytes("broj")],
     baseline: &[],
 };
 go_struct!(SasWireMessage, SAS_SCHEMA);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Read as Go reads its confirmation: `payload` is kept as it came ([`RawJson`], Go's
+/// `json.RawMessage`), `null` too, with no limit of its own on depth beyond Go's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(remote = "Self")]
 pub struct PairConfirm {
+    #[serde(default)]
     pub approved: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "keep_null"
+    )]
+    pub payload: Option<RawJson>,
 }
 
-// Go reads these as structs: from an object, `null` as `{}`, never from an array.
-object_only!(PairHello, PairConfirm);
+const CONFIRM_SCHEMA: Schema = Schema {
+    fields: &[Field::value("approved"), Field::new("payload", Kind::Raw)],
+    baseline: &[],
+};
+go_struct!(PairConfirm, CONFIRM_SCHEMA);
 
+/// The outcome of a pairing. `payload` is what the other side handed over, as it came
+/// (Go's `json.RawMessage`); [`RawJson::parse`] reads it as Go would.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairFinishResult {
     pub approved: bool,
-    pub payload: Option<serde_json::Value>,
+    pub payload: Option<RawJson>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +351,7 @@ where
 
     let raw = read_pairing_msg(stream, MAX_HELLO_LEN, line_json).await?;
 
-    let peer: PairHello = serde_json::from_slice(&raw)
+    let peer: PairHello = go_text::from_slice(&raw)
         .map_err(|e| PairingError::Serialization(format!("peer hello parse error: {e}")))?;
     if peer.protocol != identity.protocol {
         return Err(PairingError::WrongProtocol {
@@ -493,7 +530,7 @@ where
         let payload_val = if approved {
             match payload {
                 Some(p) => Some(
-                    serde_json::to_value(p)
+                    RawJson::from_value(p)
                         .map_err(|e| PairingError::Serialization(e.to_string()))?,
                 ),
                 None => None,
@@ -506,7 +543,7 @@ where
             payload: payload_val,
         };
         let mine_bytes =
-            serde_json::to_vec(&mine).map_err(|e| PairingError::Serialization(e.to_string()))?;
+            to_go_json_vec(&mine).map_err(|e| PairingError::Serialization(e.to_string()))?;
 
         let outcome = timeout(CONFIRM_TIMEOUT, async {
             write_pairing_msg(
@@ -519,7 +556,7 @@ where
             let theirs_raw = read_pairing_msg(&mut self.stream, MAX_CONFIRM_LEN, self.line_json)
                 .await
                 .map_err(|e| PairingError::PeerDisconnectedBeforeConfirm(e.to_string()))?;
-            let theirs: PairConfirm = serde_json::from_slice(&theirs_raw)
+            let theirs: PairConfirm = go_text::from_slice(&theirs_raw)
                 .map_err(|e| PairingError::PeerDisconnectedBeforeConfirm(e.to_string()))?;
             Ok::<PairConfirm, PairingError>(theirs)
         })
@@ -953,12 +990,17 @@ mod tests {
     use serde_json::json;
 
     /// (message, JSON text, what Go does). Go column: go1.27.1, `json.Unmarshal` into the
-    /// Go side's hello and confirmation. Go reads them only from an object; `null` leaves
-    /// them empty, where Rust, as for `{}`, requires the fields.
+    /// Go side's hello and confirmation. Go reads them only from an object; `null` and `{}`
+    /// leave them empty, and Rust reads them so too (more rows: the edge table of
+    /// `wire::conversation_v1`).
     #[test]
     fn pairing_messages_read_only_from_objects_as_in_go() {
         for (kind, text, go) in [
             ("hello", "[]", "GRESKA"),
+            ("hello", "null", "OK"),
+            ("hello", "{}", "OK"),
+            ("confirm", "null", "OK"),
+            ("confirm", "{}", "OK"),
             ("hello", r#"["p","d","n","v"]"#, "GRESKA"),
             (
                 "hello",
@@ -1076,8 +1118,18 @@ mod tests {
         let res_a = finish_a.await.unwrap().expect("finish A");
 
         assert!(res_a.approved && res_b.approved);
-        assert_eq!(res_b.payload, Some(json!({"note": "from A"})));
-        assert_eq!(res_a.payload, Some(json!({"note": "from B"})));
+        assert_eq!(
+            res_b
+                .payload
+                .map(|p| serde_json::from_slice::<serde_json::Value>(p.as_bytes()).unwrap()),
+            Some(serde_json::json!({"note": "from A"}))
+        );
+        assert_eq!(
+            res_a
+                .payload
+                .map(|p| serde_json::from_slice::<serde_json::Value>(p.as_bytes()).unwrap()),
+            Some(serde_json::json!({"note": "from B"}))
+        );
     }
 
     #[tokio::test]
@@ -1460,7 +1512,17 @@ mod tests {
         assert_eq!(cli_sas, srv_sas);
         assert!(cli_res.approved);
         assert!(srv_res.approved);
-        assert_eq!(srv_res.payload, Some(serde_json::json!({"ok": 2})));
-        assert_eq!(cli_res.payload, Some(serde_json::json!({"ok": 1})));
+        assert_eq!(
+            srv_res
+                .payload
+                .map(|p| serde_json::from_slice::<serde_json::Value>(p.as_bytes()).unwrap()),
+            Some(serde_json::json!({"ok": 2}))
+        );
+        assert_eq!(
+            cli_res
+                .payload
+                .map(|p| serde_json::from_slice::<serde_json::Value>(p.as_bytes()).unwrap()),
+            Some(serde_json::json!({"ok": 1}))
+        );
     }
 }

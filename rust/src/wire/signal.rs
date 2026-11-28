@@ -129,20 +129,28 @@ pub struct SignalBody {
     /// refuse values past 2^31 when it reads them): Go reads any of them, negative ones
     /// too, and only the checks after the signature say which it takes.
     ///
-    /// Go reads a missing `ver` and a `null` one as 0 (`null` leaves a Go `int` as it is),
-    /// so such a body is turned away by the shape check after the signature, as in Go, and
-    /// not already when it is read. A `null` never reaches the derive: the Go reader
-    /// ([`crate::wire::go_object`]) leaves it out, and a missing `ver` is 0.
+    /// Go reads a missing field and a `null` one as empty (`null` leaves a Go `int` or
+    /// `string` as it is), and so does Rust: a body without `ver`, `sesija`, `od`, `za`,
+    /// `sastajaliste` or `izdano`, or `null` in place of the body, is read, and the checks
+    /// after it turn it away, as in Go (an empty `od` is an unknown sender, an empty `za`
+    /// or `sastajaliste` the wrong address, `izdano` 0 a time out of range, an empty
+    /// `sesija` or `ver` 0 a bad shape). A `null` never reaches the derive: the Go reader
+    /// ([`crate::wire::go_object`]) leaves it out.
     #[serde(default)]
     pub ver: i64,
+    #[serde(default)]
     pub sesija: String,
     /// The sender's key as the message carries it. Several texts read to the same key
     /// (`\n` anywhere, extra bits in the last character, as in Go), so to compare, map,
     /// block or revoke by the sender use the key the check hands to `is_trusted`, or
     /// `public_key_to_base64` of the bytes this text reads to, never this text.
+    #[serde(default)]
     pub od: String,
+    #[serde(default)]
     pub za: String,
+    #[serde(default)]
     pub sastajaliste: String,
+    #[serde(default)]
     pub izdano: i64,
     #[serde(
         default,
@@ -189,7 +197,7 @@ pub(crate) const BODY_SCHEMA: Schema = Schema {
         Field::value("za"),
         Field::value("sastajaliste"),
         Field::int("izdano"),
-        Field::nullable("tajna"),
+        Field::bytes("tajna"),
         Field::new("kandidati", Kind::StructSlice),
         Field::new("nat", Kind::Struct),
         Field::value("odluka"),
@@ -197,16 +205,9 @@ pub(crate) const BODY_SCHEMA: Schema = Schema {
         Field::int("obradaMs"),
         Field::int("pokusaj"),
         Field::int("rttMs"),
-        Field::nullable("vj"),
+        Field::bytes("vj"),
     ],
-    baseline: &[
-        ("ver", "1"),
-        ("sesija", "\"\""),
-        ("od", "\"\""),
-        ("za", "\"\""),
-        ("sastajaliste", "\"\""),
-        ("izdano", "0"),
-    ],
+    baseline: &[],
 };
 go_struct!(SignalBody, BODY_SCHEMA);
 
@@ -225,7 +226,7 @@ pub struct SignedSignalMessage {
 }
 
 pub(crate) const SIGNED_SCHEMA: Schema = Schema {
-    fields: &[Field::nullable("tijelo"), Field::nullable("potpis")],
+    fields: &[Field::bytes("tijelo"), Field::bytes("potpis")],
     baseline: &[],
 };
 go_struct!(SignedSignalMessage, SIGNED_SCHEMA);
