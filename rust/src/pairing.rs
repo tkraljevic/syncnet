@@ -354,12 +354,11 @@ where
     let reply_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
     let reply: SasWireMessage = serde_json::from_slice(&reply_raw)
         .map_err(|e| PairingError::Serialization(e.to_string()))?;
+    // As in Go, each step looks only at the length of the field it needs; the other one
+    // may come along.
     let Some(listener_vec) = reply.broj else {
         return Err(PairingError::InvalidCommit);
     };
-    if reply.obveza.is_some() {
-        return Err(PairingError::InvalidCommit);
-    }
     let listener_nonce: [u8; SAS_NONCE_LEN] = listener_vec
         .try_into()
         .map_err(|_| PairingError::InvalidCommit)?;
@@ -401,7 +400,7 @@ where
     let Some(commit_vec) = commit_msg.obveza else {
         return Err(PairingError::InvalidCommit);
     };
-    if commit_msg.broj.is_some() || commit_vec.len() != 32 {
+    if commit_vec.len() != 32 {
         return Err(PairingError::InvalidCommit);
     }
 
@@ -419,10 +418,7 @@ where
     let Some(caller_vec) = reveal_msg.broj else {
         return Err(PairingError::InvalidCommit);
     };
-    if reveal_msg.obveza.is_some()
-        || caller_vec.len() != SAS_NONCE_LEN
-        || !verify_sas_commit(protocol, &caller_vec, &commit_vec)
-    {
+    if caller_vec.len() != SAS_NONCE_LEN || !verify_sas_commit(protocol, &caller_vec, &commit_vec) {
         return Err(PairingError::InvalidCommit);
     }
 
@@ -1223,6 +1219,117 @@ mod tests {
                 Ok(_) => "drugo",
             };
             assert_eq!(got, go, "{wire}");
+        }
+    }
+
+    /// Code agreement with the other side's messages written by hand. The Go column is
+    /// the Go side's caller and listener steps over a `json.Decoder`, measured with
+    /// go1.27.1: each step looks only at the length of the field it needs, so the other
+    /// field may come along, empty or not. `{N}` is 32 bytes of 0x11, `{O}` the commitment
+    /// to it, `{W}` 32 bytes of 0x33.
+    #[tokio::test]
+    async fn sas_steps_decide_as_go() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let protocol = "gocop";
+        let n = [0x11u8; SAS_NONCE_LEN];
+        let nb = STANDARD.encode(n);
+        let ob = STANDARD.encode(compute_sas_commit(protocol, &n));
+        assert_eq!(ob, "1P8DnN/lQvCaXqYRRfiIgK7UM0K0P7K8w7STPpG5dEo=");
+        let wb = STANDARD.encode([0x33u8; SAS_NONCE_LEN]);
+        let fill = |s: &str| {
+            s.replace("{N}", &nb)
+                .replace("{O}", &ob)
+                .replace("{W}", &wb)
+        };
+        let mine = [0x22u8; SAS_NONCE_LEN];
+
+        // The listener's answer to the caller.
+        let caller = [
+            (r#"{"broj":"{N}"}"#, true),
+            (r#"{"obveza":"","broj":"{N}"}"#, true),
+            (r#"{"obveza":[],"broj":"{N}"}"#, true),
+            (r#"{"obveza":"AA==","broj":"{N}"}"#, true),
+            (r#"{"obveza":null,"broj":"{N}"}"#, true),
+            (r#"{"obveza":"{O}","broj":"{N}"}"#, true),
+            (r#"{"Broj":"{N}"}"#, true),
+            (r#"{"broj":"AA=="}"#, false),
+            (r#"{"broj":""}"#, false),
+            ("{}", false),
+            (r#"{"broj":"{N}","broj":null}"#, false),
+        ];
+        for (reply, go_ok) in caller {
+            let reply = fill(reply);
+            let (mut a, mut b) = tokio::io::duplex(16 * 1024);
+            let peer = {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                    let _ = write_frame_async(&mut b, reply.as_bytes(), MAX_SAS_MSG_LEN).await;
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                })
+            };
+            let got = negotiate_sas_caller_async(&mut a, protocol, &mine).await;
+            assert_eq!(got.is_ok(), go_ok, "pozivatelj {reply}: {got:?}");
+            if let Ok(nonce) = got {
+                assert_eq!(nonce, n);
+            }
+            drop(a);
+            let _ = peer.await;
+        }
+
+        // The caller's commitment and reveal to the listener.
+        let listener = [
+            (r#"{"obveza":"{O}"}"#, r#"{"broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}","broj":"AA=="}"#,
+                r#"{"broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"obveza":"{O}","broj":""}"#, r#"{"broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}","broj":"{N}"}"#,
+                r#"{"broj":"{N}"}"#,
+                true,
+            ),
+            (
+                r#"{"obveza":"{O}"}"#,
+                r#"{"obveza":"AA==","broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"obveza":"{O}"}"#, r#"{"obveza":"","broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}"}"#,
+                r#"{"obveza":"{O}","broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"OBVEZA":"{O}"}"#, r#"{"BROJ":"{N}"}"#, true),
+            (r#"{"obveza":"AA=="}"#, r#"{"broj":"{N}"}"#, false),
+            (r#"{"obveza":"{O}"}"#, r#"{"broj":"{W}"}"#, false),
+            (
+                r#"{"obveza":"{O}","obveza":null}"#,
+                r#"{"broj":"{N}"}"#,
+                false,
+            ),
+            (r#"{"broj":"{N}"}"#, r#"{"broj":"{N}"}"#, false),
+        ];
+        for (commit, reveal, go_ok) in listener {
+            let (commit, reveal) = (fill(commit), fill(reveal));
+            let (mut a, mut b) = tokio::io::duplex(16 * 1024);
+            let peer = {
+                let (commit, reveal) = (commit.clone(), reveal.clone());
+                tokio::spawn(async move {
+                    let _ = write_frame_async(&mut b, commit.as_bytes(), MAX_SAS_MSG_LEN).await;
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                    let _ = write_frame_async(&mut b, reveal.as_bytes(), MAX_SAS_MSG_LEN).await;
+                })
+            };
+            let got = negotiate_sas_listener_async(&mut a, protocol, &mine).await;
+            assert_eq!(got.is_ok(), go_ok, "slusalica {commit} {reveal}: {got:?}");
+            if let Ok(nonce) = got {
+                assert_eq!(nonce, n);
+            }
+            drop(a);
+            let _ = peer.await;
         }
     }
 
