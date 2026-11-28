@@ -2,6 +2,7 @@ use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::wire::go_bytes;
 use crate::wire::go_json::to_go_json_vec;
 use crate::wire::go_object::{Field, Kind, Schema, go_struct};
+use crate::wire::go_text;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -182,20 +183,20 @@ pub struct SignalBody {
 
 pub(crate) const BODY_SCHEMA: Schema = Schema {
     fields: &[
-        Field::value("ver"),
+        Field::int("ver"),
         Field::value("sesija"),
         Field::value("od"),
         Field::value("za"),
         Field::value("sastajaliste"),
-        Field::value("izdano"),
+        Field::int("izdano"),
         Field::nullable("tajna"),
         Field::new("kandidati", Kind::StructSlice),
         Field::new("nat", Kind::Struct),
         Field::value("odluka"),
         Field::value("razlog"),
-        Field::value("obradaMs"),
-        Field::value("pokusaj"),
-        Field::value("rttMs"),
+        Field::int("obradaMs"),
+        Field::int("pokusaj"),
+        Field::int("rttMs"),
         Field::nullable("vj"),
     ],
     baseline: &[
@@ -250,7 +251,8 @@ impl SignedSignalMessage {
     }
 
     pub fn parse_unverified_header(&self) -> Result<SignalBody, SignalError> {
-        serde_json::from_slice(&self.tijelo).map_err(|e| SignalError::InvalidShape(e.to_string()))
+        // Bytes that are not UTF-8 are read as Go reads them (`go_text`).
+        go_text::from_slice(&self.tijelo).map_err(|e| SignalError::InvalidShape(e.to_string()))
     }
 }
 

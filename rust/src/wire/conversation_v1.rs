@@ -5,6 +5,8 @@
 //! the general ledger abstraction is designed.
 
 use crate::wire::go_json::to_go_json_vec;
+use crate::wire::go_object::{Field, Kind, Schema, go_struct, object_only};
+use crate::wire::{go_text, go_time};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::{collections::BTreeMap, fmt};
@@ -75,6 +77,7 @@ fn is_false(v: &bool) -> bool {
 
 /// Wire envelope shared across conversation versions. `odbijeno` carries no `payload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct EnvelopeV1 {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,11 +111,14 @@ impl EnvelopeV1 {
         let Some(ref raw) = self.payload else {
             return Err(ConversationV1Error::Json("missing payload".to_owned()));
         };
+        // Go reads the payload as a text of its own, so its depth counts from its top.
+        go_text::check_depth(raw.get(), 0).map_err(ConversationV1Error::Json)?;
         serde_json::from_str(raw.get()).map_err(|e| ConversationV1Error::Json(e.to_string()))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct WantsSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     pub all: bool,
@@ -125,6 +131,7 @@ pub struct WantsSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct FrontierPayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub frontier: BTreeMap<String, String>,
@@ -155,12 +162,14 @@ pub struct FrontierPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct GranicaOdbijenihPayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub granica: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct HoleRange {
     pub od: String,
     #[serde(rename = "do")]
@@ -168,21 +177,43 @@ pub struct HoleRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct RupePayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub trazim: BTreeMap<String, HoleRange>,
 }
 
+/// A version as the ledger sends it, read as Go reads its version (see
+/// [`crate::wire::go_object`]): field names in any ASCII case, the last of a repeated
+/// field, a missing field or `null` as Go's empty value, and keys Go does not know
+/// skipped. The payload is kept as it came (`json.RawMessage`), `null` too; a missing one
+/// is `null`, as Go writes it and signs it.
+///
+/// `created_at` is read as Go reads a time ([`crate::wire::go_time`]): a version whose time
+/// Go does not read is an error, so the message that carries it is refused, as in Go.
+/// The text is kept as it came, unescaped; a missing or `null` time is Go's zero time,
+/// `0001-01-01T00:00:00Z`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct VersionV1 {
+    #[serde(default)]
     pub version_id: String,
+    #[serde(default)]
     pub entity: String,
+    #[serde(default)]
     pub entity_id: String,
+    #[serde(default)]
     pub node_id: String,
+    #[serde(default)]
     pub supersedes: String,
+    #[serde(default)]
     pub archived: bool,
+    #[serde(default = "null_payload")]
     pub payload: Box<RawValue>,
+    #[serde(default = "go_zero_time_text", deserialize_with = "go_time_text")]
     pub created_at: String,
+    /// Go reads any `int` here; this takes 0 to 2^32 - 1 only.
+    #[serde(default)]
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
@@ -195,7 +226,64 @@ pub struct VersionV1 {
     pub kljuc_autora: String,
 }
 
+/// Go's field names (`json` tags) of a version.
+pub(crate) const VERSION_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("version_id"),
+        Field::value("entity"),
+        Field::value("entity_id"),
+        Field::value("node_id"),
+        Field::value("supersedes"),
+        Field::value("archived"),
+        Field::new("payload", Kind::Raw),
+        Field::time("created_at"),
+        Field::int("schema_version"),
+        Field::value("channel"),
+        Field::value("potpis"),
+        Field::value("kljuc_autora"),
+    ],
+    baseline: &[],
+};
+go_struct!(VersionV1, VERSION_SCHEMA);
+
+// Go reads these as structs: from an object, `null` as `{}`, never from an array.
+object_only!(
+    EnvelopeV1,
+    WantsSpec,
+    FrontierPayload,
+    GranicaOdbijenihPayload,
+    HoleRange,
+    RupePayload,
+    DeltaPayload,
+    ZeljePayload,
+    ContentItemV1,
+    SadrzajPayload,
+    DonePayload,
+);
+
+fn null_payload() -> Box<RawValue> {
+    RawValue::from_string("null".to_owned()).expect("null is JSON")
+}
+
+/// What Go writes for a time never set.
+const GO_ZERO_TIME_TEXT: &str = "0001-01-01T00:00:00Z";
+
+fn go_zero_time_text() -> String {
+    GO_ZERO_TIME_TEXT.to_owned()
+}
+
+/// A time as Go reads it, kept as the unescaped text. `null` never gets here: the Go
+/// reader leaves it out, so the field is Go's zero time.
+fn go_time_text<'de, D: Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    let raw = Box::<RawValue>::deserialize(de)?;
+    match go_time::from_json(raw.get()).map_err(serde::de::Error::custom)? {
+        Some(_) => serde_json::from_str(raw.get()).map_err(serde::de::Error::custom),
+        None => Ok(go_zero_time_text()),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct DeltaPayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub versions: Vec<VersionV1>,
@@ -216,12 +304,14 @@ pub struct DeltaPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct ZeljePayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub otisci: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ContentItemV1 {
     pub otisak: String,
     pub vrsta: String,
@@ -232,12 +322,14 @@ pub struct ContentItemV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct SadrzajPayload {
     #[serde(default, deserialize_with = "null_as_default")]
     pub stavke: Vec<ContentItemV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct DonePayload {
     pub applied: u64,
 }
@@ -281,7 +373,8 @@ where
     T: DeserializeOwned,
 {
     let line = read_line_bytes(reader, max_bytes).await?;
-    serde_json::from_slice(&line).map_err(|e| ConversationV1Error::Json(e.to_string()))
+    // Bytes that are not UTF-8 are read as Go reads them (`go_text`).
+    go_text::from_slice(&line).map_err(|e| ConversationV1Error::Json(e.to_string()))
 }
 
 pub async fn write_line_message<W, T>(
@@ -543,6 +636,436 @@ mod tests {
             to_line(&env_special),
             v["deltaSPosebnimZnakovima"].as_str().unwrap()
         );
+    }
+
+    /// (`v` a version, `d` a delta message; JSON text; what Go reads; what Rust does).
+    /// Go column: go1.27.1, `json.Unmarshal` into the ledger's version (`d`: a struct with
+    /// its `versions`), the time as Unix seconds. Rust: `isto` reads the same, `GRESKA`
+    /// refuses where Go reads: only a `schema_version` outside `u32`.
+    const VERSION_EDGES: &[(&str, &str, &str, &str)] = &[
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"VERSION_ID":"v","Entity":"e","entity_ID":"i","NODE_id":"n","SUPERSEDES":"s","ARCHIVED":true,"PAYLOAD":{"a":1},"Created_At":"2025-10-09T08:53:20Z","SCHEMA_VERSION":2,"CHANNEL":"c","POTPIS":"p","KLJUC_AUTORA":"k"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=true pl={"a":1} ca=1760000000 sv=2 ch=c pot=p ka=k"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"ſuperſedeſ":"s2","Kljuc_autora":"k2","ar\u0063hived":true}"#,
+            r#"vid=v ent=e eid=i node=n sup=s2 arh=true pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=k2"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"supersıdes":"x","node_İd":"x"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"node_id":"a","NODE_ID":"b"}"#,
+            r#"vid=v ent=e eid=i node=b sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"payload":{"b":2},"Payload":[ 1 ,2 ]}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl=[ 1 ,2 ] ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"payload":null}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl=null ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"payload":null,"payload":"x"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl="x" ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T08:53:21Z","CREATED_AT":"2025-10-09T08:53:22.5Z"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000002 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T08:53:21Z","created_at":null}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000001 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09t08:53:21Z","created_at":"2025-10-09T08:53:22Z"}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T08:53:22Z","created_at":"x"}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"archived":true,"archived":null}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=true pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"schema_version":"1","schema_version":1}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":null,"entity":null,"entity_id":null,"node_id":null,"supersedes":null,"archived":null,"payload":null,"created_at":null,"schema_version":null,"channel":null,"potpis":null,"kljuc_autora":null}"#,
+            r#"vid= ent= eid= node= sup= arh=false pl=null ca=-62135596800 sv=0 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{}"#,
+            r#"vid= ent= eid= node= sup= arh=false pl=null ca=-62135596800 sv=0 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"null"#,
+            r#"vid= ent= eid= node= sup= arh=false pl=null ca=-62135596800 sv=0 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"payload":{"a":1}}"#,
+            r#"vid= ent= eid= node= sup= arh=false pl={"a":1} ca=-62135596800 sv=0 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"x":1,"versions":[],"payload2":5,"\ud800":"y"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09\u005408:53:20Z"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T10:53:20.75+02:00"}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":1760000000}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":""}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T08:53:20\ud800"}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"entity":"a\ud800b","node_id":"\udc00","payload":{"t":"\ud800 \u0041"}}"#,
+            r#"vid=v ent=a�b eid=i node=� sup=s arh=false pl={"t":"\ud800 \u0041"} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"archived":"true"}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"schema_version":1.5}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"schema_version":-1}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=-1 ch= pot= ka="#,
+            "GRESKA",
+        ),
+        ("v", r#"[]"#, r#"GRESKA"#, "isto"),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1},{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"version_id":"w"}]}"#,
+            r#"n=2 [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=] [vid=w ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=]"#,
+            "isto",
+        ),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1},{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":"2025-10-09T08:53:60Z"}]}"#,
+            r#"GRESKA"#,
+            "isto",
+        ),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1},{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"created_at":null}]}"#,
+            r#"n=2 [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=] [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=]"#,
+            "isto",
+        ),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1},{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"entity":"\ud800"}]}"#,
+            r#"n=2 [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=] [vid=v ent=� eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=]"#,
+            "isto",
+        ),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1},null]}"#,
+            r#"n=2 [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka=] [vid= ent= eid= node= sup= arh=false pl=null ca=-62135596800 sv=0 ch= pot= ka=]"#,
+            "isto",
+        ),
+        ("d", r#"{"versions":null}"#, r#"n=0 "#, "isto"),
+        // `-0` is 0 in Go's `int`; other zeros that are not integers stay errors.
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":-0}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=0 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version": -0 ,"schema_version":-0,"Schema_Version":3}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=3 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":-0.0}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":0.0}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1e0}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":"-0"}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "d",
+            r#"{"versions":[{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":-0}]}"#,
+            r#"n=1 [vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=0 ch= pot= ka=]"#,
+            "isto",
+        ),
+        // A control character written as it is in a key is an error; as an escape the key
+        // names no field.
+        (
+            "v",
+            "{\"version_id\":\"v\",\"entity\":\"e\",\"entity_id\":\"i\",\"node_id\":\"n\",\"supersedes\":\"s\",\"archived\":false,\"payload\":{\"a\":1},\"created_at\":\"2025-10-09T08:53:20Z\",\"schema_version\":1,\"k\u{2}\":1}",
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "v",
+            "{\"version_id\":\"v\",\"entity\":\"e\",\"entity_id\":\"i\",\"node_id\":\"n\",\"supersedes\":\"s\",\"archived\":false,\"payload\":{\"a\":1},\"created_at\":\"2025-10-09T08:53:20Z\",\"schema_version\":1,\"a\nb\":1}",
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "v",
+            r#"{"version_id":"v","entity":"e","entity_id":"i","node_id":"n","supersedes":"s","archived":false,"payload":{"a":1},"created_at":"2025-10-09T08:53:20Z","schema_version":1,"a\u0001b":1,"\u0000":2}"#,
+            r#"vid=v ent=e eid=i node=n sup=s arh=false pl={"a":1} ca=1760000000 sv=1 ch= pot= ka="#,
+            "isto",
+        ),
+        (
+            "d",
+            "{\"versions\":[{\"version_id\":\"v\",\"k\u{2}\":1}]}",
+            "GRESKA",
+            "isto",
+        ),
+        // Go reads a struct only from an object (or `null`), never from an array.
+        ("d", "[]", "GRESKA", "isto"),
+        (
+            "d",
+            r#"[[{"version_id":"x","created_at":"2025-10-09T08:53:20Z"}]]"#,
+            "GRESKA",
+            "isto",
+        ),
+        ("d", r#"{"versions":[[]]}"#, "GRESKA", "isto"),
+        ("d", r#"{"rupe":{"k":["a","b"]}}"#, "GRESKA", "isto"),
+        ("d", "null", "n=0 ", "isto"),
+    ];
+
+    fn version_reading(v: &VersionV1) -> String {
+        let ca = crate::wire::go_time::parse(v.created_at.as_bytes()).map_or(i64::MIN, |t| t.unix);
+        format!(
+            "vid={} ent={} eid={} node={} sup={} arh={} pl={} ca={ca} sv={} ch={} pot={} ka={}",
+            v.version_id,
+            v.entity,
+            v.entity_id,
+            v.node_id,
+            v.supersedes,
+            v.archived,
+            v.payload.get(),
+            v.schema_version,
+            v.channel.as_deref().unwrap_or(""),
+            v.potpis,
+            v.kljuc_autora,
+        )
+    }
+
+    #[test]
+    fn versions_read_as_in_go() {
+        let mut refused = 0;
+        for (kind, text, go, rust) in VERSION_EDGES {
+            let got = if *kind == "v" {
+                serde_json::from_str::<VersionV1>(text).map(|v| version_reading(&v))
+            } else {
+                serde_json::from_str::<DeltaPayload>(text).map(|d| {
+                    let vs: Vec<String> = d
+                        .versions
+                        .iter()
+                        .map(|v| format!("[{}]", version_reading(v)))
+                        .collect();
+                    format!("n={} {}", d.versions.len(), vs.join(" "))
+                })
+            }
+            .unwrap_or_else(|_| "GRESKA".to_owned());
+            if *rust == "GRESKA" {
+                assert_ne!(*go, "GRESKA", "{text}");
+                assert_eq!(got, "GRESKA", "{text}");
+                refused += 1;
+            } else {
+                assert_eq!(got, *go, "{text}");
+            }
+        }
+        assert_eq!(refused, 1);
+    }
+
+    /// (message, JSON text, what Go does). Go column: go1.27.1, `json.Unmarshal` into the
+    /// Go side's envelope and messages. Go reads a struct only from an object; `null`
+    /// leaves it empty, and Rust reads it as `{}`. Rust refuses where Go reads in one way
+    /// only: a field Rust requires (`kind`, `applied`) is missing, as in `{}`.
+    const MESSAGE_SHAPES: &[(&str, &str, &str)] = &[
+        ("env", "[]", "GRESKA"),
+        (
+            "env",
+            r#"["delta",null,null,"dev",{"versions":[]}]"#,
+            "GRESKA",
+        ),
+        (
+            "env",
+            r#"{"kind":"delta","deviceId":"dev","payload":[[]]}"#,
+            "OK",
+        ),
+        ("env", r#"{"kind":"x"}"#, "OK"),
+        ("frontier", "[]", "GRESKA"),
+        ("frontier", "[{}]", "GRESKA"),
+        ("frontier", "null", "OK"),
+        ("frontier", r#"{"frontier":{}}"#, "OK"),
+        ("frontier", r#"{"frontier":[]}"#, "GRESKA"),
+        ("frontier", r#"{"frontier":{},"wants":[true]}"#, "GRESKA"),
+        ("frontier", r#"{"frontier":{},"wants":{"all":true}}"#, "OK"),
+        ("granica", "[]", "GRESKA"),
+        ("granica", "null", "OK"),
+        ("granica", r#"{"granica":{}}"#, "OK"),
+        ("granica", r#"{"granica":[]}"#, "GRESKA"),
+        ("rupe", "[]", "GRESKA"),
+        ("rupe", "null", "OK"),
+        ("rupe", r#"{"trazim":{"k":["a","b"]}}"#, "GRESKA"),
+        ("rupe", r#"{"trazim":{"k":{"od":"a","do":"b"}}}"#, "OK"),
+        ("delta", r#"{"versions":[],"skraceno":true}"#, "OK"),
+        ("delta", r#"{"rupe":{"k":{"od":"a","do":"b"}}}"#, "OK"),
+        ("zelje", "[]", "GRESKA"),
+        ("zelje", r#"[["a"]]"#, "GRESKA"),
+        ("zelje", "null", "OK"),
+        ("zelje", r#"{"otisci":["a"]}"#, "OK"),
+        ("sadrzaj", "[]", "GRESKA"),
+        ("sadrzaj", "null", "OK"),
+        ("sadrzaj", r#"{"stavke":[["o","v","",1,"AA=="]]}"#, "GRESKA"),
+        (
+            "sadrzaj",
+            r#"{"stavke":[{"otisak":"o","vrsta":"v","kanal":"","bajtova":1,"podaci":"AA=="}]}"#,
+            "OK",
+        ),
+        ("done", "[]", "GRESKA"),
+        ("done", "[5]", "GRESKA"),
+        ("done", r#"{"applied":5}"#, "OK"),
+    ];
+
+    #[test]
+    fn messages_read_only_from_objects_as_in_go() {
+        fn ok<T: DeserializeOwned>(text: &str) -> &'static str {
+            serde_json::from_str::<T>(text).map_or("GRESKA", |_| "OK")
+        }
+        for (kind, text, go) in MESSAGE_SHAPES {
+            let got = match *kind {
+                "env" => ok::<EnvelopeV1>(text),
+                "frontier" => ok::<FrontierPayload>(text),
+                "granica" => ok::<GranicaOdbijenihPayload>(text),
+                "rupe" => ok::<RupePayload>(text),
+                "delta" => ok::<DeltaPayload>(text),
+                "zelje" => ok::<ZeljePayload>(text),
+                "sadrzaj" => ok::<SadrzajPayload>(text),
+                _ => ok::<DonePayload>(text),
+            };
+            assert_eq!(got, *go, "{kind} {text}");
+        }
+        // Go reads these as empty; Rust requires the field, as it does in `{}`.
+        assert!(serde_json::from_str::<EnvelopeV1>("null").is_err());
+        assert!(serde_json::from_str::<DonePayload>("null").is_err());
+    }
+
+    /// Go refuses a line nested deeper than 10 000 levels (go1.27.1), also when the deep
+    /// part is a version's payload, which it keeps raw.
+    #[tokio::test]
+    async fn line_nested_deeper_than_go_reads_is_refused() {
+        for (whole, go) in [(10_000, true), (10_001, false)] {
+            // The line, the payload, `versions` and the version are four levels.
+            let n = whole - 4;
+            let line = format!(
+                "{{\"kind\":\"delta\",\"payload\":{{\"versions\":[{{\"version_id\":\"v\",\"payload\":{}{}}}]}}}}\n",
+                "[".repeat(n),
+                "]".repeat(n)
+            );
+            let (mut w, mut r) = tokio::io::duplex(64 * 1024);
+            w.write_all(line.as_bytes()).await.unwrap();
+            let got = read_line_message::<_, EnvelopeV1>(&mut r, 1 << 20).await;
+            assert_eq!(got.is_ok(), go, "{whole}");
+            if let Ok(env) = got {
+                let d: DeltaPayload = env.parse_payload().unwrap();
+                assert_eq!(d.versions[0].payload.get().len(), 2 * n);
+            }
+        }
     }
 
     #[tokio::test]

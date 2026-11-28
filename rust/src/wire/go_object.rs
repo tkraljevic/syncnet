@@ -24,14 +24,26 @@
 //!   the later array does not reach stays under the slice and comes back when a still
 //!   later array is long enough. `null` or `[]` in place of the array starts again.
 //!   The slice is as long as the last array.
+//! - a `json.RawMessage` keeps the value as it came, `null` too, and the last one counts;
+//! - text in a key or a field is read as Go reads it ([`crate::wire::go_text`]): a lone
+//!   surrogate escape is U+FFFD. A key with one names no field, as no field name has
+//!   U+FFFD. A raw field keeps its escapes as they came, as Go keeps them. A control
+//!   character (U+0000 to U+001F) written as it is, not as an escape, is an error in a key
+//!   as in a value;
+//! - a value nested deeper than Go reads ([`go_text::MAX_DEPTH`], the object itself
+//!   counted) is an error, also in a field Go skips;
+//! - `-0` is 0 in a field Go reads as a signed integer (`int`, `int64`), as Go's
+//!   `strconv.ParseInt` reads it. `-0.0`, `0.0` and `1e0` are not integers there, in Go
+//!   as in serde.
 //!
 //! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and `go_struct!`
 //! puts this reader in front of it: keys are mapped to field names, repeats are settled,
 //! and the derive reads the result.
 
-use crate::wire::go_time;
-use serde::de::{self, Deserializer, MapAccess, Visitor};
+use crate::wire::{go_text, go_time};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
 
@@ -51,6 +63,11 @@ pub enum Kind {
     /// ([`crate::wire::go_time`]). A rule the struct sets on the value it keeps (as on a
     /// record's `expiresAt`) holds only for the last one.
     Time,
+    /// A `json.RawMessage`: the value as it came, `null` too; the last one counts. Its
+    /// text is not read, so a lone surrogate in it stays as written, as in Go.
+    Raw,
+    /// A signed integer (`int`, `int64`): as [`Kind::Value`], and `-0` is 0.
+    Int,
 }
 
 /// A field as Go names it, with its kind.
@@ -75,6 +92,10 @@ impl Field {
 
     pub const fn time(name: &'static str) -> Self {
         Self::new(name, Kind::Time)
+    }
+
+    pub const fn int(name: &'static str) -> Self {
+        Self::new(name, Kind::Int)
     }
 }
 
@@ -105,6 +126,21 @@ pub fn name_matches(key: &str, name: &str) -> bool {
 
 type Entries = Vec<(String, Box<RawValue>)>;
 
+/// A key as Go reads it: a lone surrogate escape in it is not an error but U+FFFD. Such
+/// a key names no field. The key is taken as it was written (`serde_json` checks it as it
+/// checks a raw value: a control character written as it is fails, escapes need not be
+/// characters) and then read as text the way Go reads it.
+struct GoKey(String);
+
+impl<'de> Deserialize<'de> for GoKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(d)?;
+        serde_json::from_str(&go_text::lone_surrogates(raw.get()))
+            .map(GoKey)
+            .map_err(de::Error::custom)
+    }
+}
+
 struct EntriesVisitor;
 
 impl<'de> Visitor<'de> for EntriesVisitor {
@@ -124,8 +160,10 @@ impl<'de> Visitor<'de> for EntriesVisitor {
         A: MapAccess<'de>,
     {
         let mut out = Vec::new();
-        while let Some(entry) = map.next_entry::<String, Box<RawValue>>()? {
-            out.push(entry);
+        while let Some((GoKey(key), value)) = map.next_entry::<GoKey, Box<RawValue>>()? {
+            // The object is one level, so its value may be one less than Go's limit.
+            go_text::check_depth(value.get(), 1).map_err(de::Error::custom)?;
+            out.push((key, value));
         }
         Ok(out)
     }
@@ -178,30 +216,45 @@ fn settle<T>(
     for (field, values) in schema.fields.iter().zip(&seen) {
         if values.len() > 1 {
             // Go reads every one of them, so a bad one fails the whole object.
-            for v in values.iter().filter(|v| !is_null(v)) {
+            // A raw value is any JSON, which it already is.
+            for v in values
+                .iter()
+                .filter(|v| !is_null(v) && field.kind != Kind::Raw)
+            {
+                let text = as_go_reads(field.kind, v.get());
                 if field.kind == Kind::Time {
-                    go_time::from_json(v.get())?;
+                    go_time::from_json(&text)?;
                 } else {
-                    check(schema, field.name, v.get(), finish)?;
+                    check(schema, field.name, &text, finish)?;
                 }
             }
         }
         let last = match field.kind {
-            Kind::Value | Kind::Time => values
+            Kind::Value | Kind::Int | Kind::Time => values
                 .iter()
                 .rev()
                 .find(|v| !is_null(v))
                 .map(|v| v.get().to_owned()),
-            Kind::Nullable => values.last().map(|v| v.get().to_owned()),
+            Kind::Nullable | Kind::Raw => values.last().map(|v| v.get().to_owned()),
             Kind::Struct => merged(values)?,
             Kind::StructSlice => merged_slice(values)?,
         };
         if let Some(raw) = last {
-            push_entry(&mut out, field.name, &raw);
+            push_entry(&mut out, field.name, &as_go_reads(field.kind, &raw));
         }
     }
     out.push('}');
     finish(&out).map_err(|e| e.to_string())
+}
+
+/// A field's value as the derive should read it to get what Go reads: a raw value as it
+/// came, `-0` as 0 for a signed integer, and text with Go's U+FFFD for a lone surrogate.
+fn as_go_reads(kind: Kind, raw: &str) -> Cow<'_, str> {
+    match kind {
+        Kind::Raw => raw.into(),
+        Kind::Int if raw.trim() == "-0" => "0".into(),
+        _ => go_text::lone_surrogates(raw),
+    }
 }
 
 /// The smallest object the struct takes, with `name` set to `raw` when given.
@@ -345,6 +398,66 @@ macro_rules! go_struct {
     };
 }
 pub(crate) use go_struct;
+
+/// A deserializer that lets a struct's own serde derive read only a JSON object, or
+/// `null`, which it reads as `{}`. Go reads a struct from an object and leaves it as it
+/// was for `null`; an array is an error, where serde's derive would read the fields in
+/// order from it. Used through [`object_only!`].
+pub(crate) struct ObjectOnly<D>(pub D);
+
+impl<'de, D: Deserializer<'de>> Deserializer<'de> for ObjectOnly<D> {
+    type Error = D::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+        self.0.deserialize_any(ObjectVisitor(visitor))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum
+        identifier ignored_any
+    }
+}
+
+struct ObjectVisitor<V>(V);
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for ObjectVisitor<V> {
+    type Value = V::Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.expecting(f)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        self.0.visit_map(map)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        let empty = std::iter::empty::<((), ())>();
+        self.0
+            .visit_map(de::value::MapDeserializer::<_, E>::new(empty))
+    }
+}
+
+/// Serialize and Deserialize for structs derived with `#[serde(remote = "Self")]`: writing
+/// is the derive's, and so is reading, but only from an object or `null`
+/// ([`ObjectOnly`]).
+macro_rules! object_only {
+    ($($ty:ty),* $(,)?) => {$(
+        impl serde::Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                <$ty>::serialize(self, s)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                <$ty>::deserialize($crate::wire::go_object::ObjectOnly(d))
+            }
+        }
+    )*};
+}
+pub(crate) use object_only;
 
 #[cfg(test)]
 mod tests {
@@ -955,6 +1068,94 @@ mod tests {
             "ver=0 sesija= od= za= sast= izdano=0 tajna=nil kand=[] nat=nil odluka= razlog= obrada=0 pokusaj=0 rtt=0 vj=nil",
             "GRESKA",
         ),
+        // Text Go reads as U+FFFD (`go_text`): a lone surrogate escape in a key names no
+        // field, in a text it is U+FFFD, in base64 it is an error, as in Go.
+        (
+            "pp",
+            r#"{"tijelo":"e30=","\ud800":"x","potpis":"AQ=="}"#,
+            "t=hex:7b7d p=hex:01",
+            "isto",
+        ),
+        (
+            "pp",
+            r#"{"tijelo":"e30=","potpis":"AQ==","x":"\udc00"}"#,
+            "t=hex:7b7d p=hex:01",
+            "isto",
+        ),
+        (
+            "pp",
+            r#"{"tijelo":"e30=","potpis":"AQ==\ud800"}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","razlog":"a\ud800b""#,
+            "~razlog=a\u{FFFD}b",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","odluka":"\udc00\ud800","sesija":"\ud83d\ude00""#,
+            "~odluka=\u{FFFD}\u{FFFD} sesija=\u{1F600}",
+            "isto",
+        ),
+        (
+            "tp",
+            r#","kandidati":[{"vrsta":"\ud800","adresa":"1"}],"nat":{"vrsta":"\udfff"}"#,
+            "~kand=[\u{FFFD}/1] nat=\u{FFFD}/false",
+            "isto",
+        ),
+        ("tp", r#","tajna":"\ud800""#, "GRESKA", "isto"),
+        ("tp", r#","po\ud800kusaj":1"#, "~", "isto"),
+        // A control character written as it is in a key is an error, as in a value; as an
+        // escape it is a key that names no field. U+007F is not a control character here.
+        (
+            "pp",
+            "{\"tijelo\":\"e30=\",\"potpis\":\"AQ==\",\"a\u{1}b\":1}",
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "pp",
+            "{\"tijelo\":\"e30=\",\"potpis\":\"AQ==\",\"a\nb\":1}",
+            "GRESKA",
+            "isto",
+        ),
+        ("tp", ",\"\u{1f}\":1", "GRESKA", "isto"),
+        ("tp", ",\"\u{0}\":1", "GRESKA", "isto"),
+        (
+            "tp",
+            ",\"kandidati\":[{\"vrsta\":\"a\",\"\u{3}\":1}]",
+            "GRESKA",
+            "isto",
+        ),
+        ("sas", "{\"broj\":\"AA==\",\"\u{2}\":1}", "GRESKA", "isto"),
+        (
+            "pp",
+            r#"{"tijelo":"e30=","potpis":"AQ==","a\u0001b":1,"\u0000":2}"#,
+            "t=hex:7b7d p=hex:01",
+            "isto",
+        ),
+        ("tp", ",\"a\u{7f}b\":1", "~", "isto"),
+        ("tp", r#","a\x":1"#, "GRESKA", "isto"),
+        // `-0` in an `int` is 0, as Go's `strconv.ParseInt` reads it; other spellings of
+        // zero that are not integers stay errors, and so does `-0` in a text or bytes.
+        ("tp", r#","ver":-0"#, "~ver=0", "isto"),
+        ("tp", r#","izdano": -0 "#, "~izdano=0", "isto"),
+        ("tp", r#","pokusaj":-0"#, "~", "isto"),
+        ("tp", r#","POKUSAJ":-0"#, "~", "isto"),
+        ("tp", r#","obradaMs":-0,"obradaMs":2"#, "~obrada=2", "isto"),
+        ("tp", r#","rttMs":2,"rttMs":-0"#, "~", "isto"),
+        ("tp", r#","pokusaj":-1"#, "~pokusaj=-1", "isto"),
+        ("tp", r#","pokusaj":-0.0"#, "GRESKA", "isto"),
+        ("tp", r#","pokusaj":-0e0"#, "GRESKA", "isto"),
+        ("tp", r#","pokusaj":-0E+0"#, "GRESKA", "isto"),
+        ("tp", r#","rttMs":0.0"#, "GRESKA", "isto"),
+        ("tp", r#","rttMs":1e0"#, "GRESKA", "isto"),
+        ("tp", r#","sesija":-0"#, "GRESKA", "isto"),
+        ("tp", r#","tajna":-0"#, "GRESKA", "isto"),
+        ("tp", r#","nat":{"vrsta":-0}"#, "GRESKA", "isto"),
         // Code agreement.
         ("sas", r#"{"broj":"AA=="}"#, "o=nil b=hex:00", "isto"),
         ("sas", r#"{"Broj":"AA=="}"#, "o=nil b=hex:00", "isto"),
@@ -1006,7 +1207,53 @@ mod tests {
         ),
         ("sas", "{}", "o=nil b=nil", "isto"),
         ("sas", "null", "o=nil b=nil", "isto"),
+        (
+            "sas",
+            r#"{"broj":"AA==","\ud800":1}"#,
+            "o=nil b=hex:00",
+            "isto",
+        ),
+        ("sas", r#"{"broj":"AA\ud800=="}"#, "GRESKA", "isto"),
     ];
+
+    /// (struct, text with `{}` where the deep value goes, how many levels the text adds
+    /// around it, Go). The deep value is arrays, then objects, nested so that the whole
+    /// text is 10 000 or 10 001 levels deep. Go column: go1.27.1 through `json.Unmarshal`,
+    /// which refuses the whole text past 10 000 levels, also in a field it skips.
+    const DEPTHS: &[(&str, &str, usize)] = &[
+        ("pp", r#"{"tijelo":"e30=","potpis":"AQ==","zz":{}}"#, 1),
+        ("sas", r#"{"broj":"AA==","zz":{}}"#, 1),
+        ("tp", r#","zz":{}"#, 1),
+        ("tp", r#","kandidati":[{"vrsta":"a","zz":{}}]"#, 3),
+        ("tp", r#","nat":{"vrsta":"a","zz":{}}"#, 2),
+    ];
+
+    #[test]
+    fn values_nested_deeper_than_go_reads_are_refused() {
+        for (kind, text, around) in DEPTHS {
+            for (whole, go) in [(10_000, "OK"), (10_001, "GRESKA")] {
+                let n = whole - around;
+                for deep in [
+                    format!("{}{}", "[".repeat(n), "]".repeat(n)),
+                    format!("{}1{}", "{\"b\":".repeat(n), "}".repeat(n)),
+                ] {
+                    let text = text.replacen("{}", &deep, 1);
+                    let text = if *kind == "tp" {
+                        format!("{{{B}{text}}}")
+                    } else {
+                        text
+                    };
+                    let got = match *kind {
+                        "pp" => read_pp(&text),
+                        "sas" => read_sas(&text),
+                        _ => read_tp(&text),
+                    };
+                    let got = if got == "GRESKA" { "GRESKA" } else { "OK" };
+                    assert_eq!(got, go, "{kind} {whole} {}", &text[..40]);
+                }
+            }
+        }
+    }
 
     /// Go's reading in full: a `~` row is [`BODY`] with the listed fields changed.
     fn go_reading(kind: &str, go: &str) -> String {

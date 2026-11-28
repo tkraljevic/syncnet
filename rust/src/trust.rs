@@ -399,10 +399,6 @@ fn go_zero_time() -> GoTime {
     }
 }
 
-fn go_zero_unix() -> i64 {
-    GO_ZERO_TIME_UNIX
-}
-
 fn no_expiry() -> Expiry {
     Expiry::NEVER
 }
@@ -684,27 +680,55 @@ impl Membership {
 /// `targetId`, `revokedAt`, `revokedBy`, `signerKey` and `signature` name nothing in Go,
 /// so a revocation written with them reads as one with those fields empty, whose
 /// signature does not hold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", rename_all = "camelCase")]
+///
+/// Its times keep the part of a second they were written with (`issued_at_nanos`,
+/// `revoked_at_nanos`) and are written back with it, as Go writes them. The signature and
+/// the id cover whole seconds only, and Go decides on whole seconds too (a revocation
+/// revokes what was issued up to its second), so the part of a second changes no outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revocation {
-    #[serde(default)]
     pub id: String,
-    #[serde(rename = "vrsta", default)]
     pub kind: String,
-    #[serde(rename = "nodeId", default)]
     pub target_id: String,
-    #[serde(default)]
     pub public_key: String,
-    #[serde(default = "go_zero_unix", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(rename = "opozvanoAt", default = "go_zero_unix", with = "rfc3339_unix")]
+    /// The part of a second past `issued_at`, in nanoseconds; 0 for a revocation Go or
+    /// Rust signed. Not signed.
+    pub issued_at_nanos: u32,
     pub revoked_at: i64,
-    #[serde(rename = "opozvao", default)]
+    /// The part of a second past `revoked_at`, as `issued_at_nanos`.
+    pub revoked_at_nanos: u32,
     pub revoked_by: String,
-    #[serde(rename = "potpisnik", default)]
     pub signer_key: String,
-    #[serde(rename = "potpis", default)]
     pub signature: String,
+}
+
+/// A revocation as the wire carries it, its times in full.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Self", rename_all = "camelCase")]
+struct RevocationWire {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "vrsta", default)]
+    kind: String,
+    #[serde(rename = "nodeId", default)]
+    target_id: String,
+    #[serde(default)]
+    public_key: String,
+    #[serde(default = "go_zero_time", with = "rfc3339_unix::time")]
+    issued_at: GoTime,
+    #[serde(
+        rename = "opozvanoAt",
+        default = "go_zero_time",
+        with = "rfc3339_unix::time"
+    )]
+    revoked_at: GoTime,
+    #[serde(rename = "opozvao", default)]
+    revoked_by: String,
+    #[serde(rename = "potpisnik", default)]
+    signer_key: String,
+    #[serde(rename = "potpis", default)]
+    signature: String,
 }
 
 /// Go's field names (`json` tags) of a revocation.
@@ -722,7 +746,60 @@ pub(crate) const REVOCATION_SCHEMA: Schema = Schema {
     ],
     baseline: &[],
 };
-go_struct!(Revocation, REVOCATION_SCHEMA);
+go_struct!(RevocationWire, REVOCATION_SCHEMA);
+
+impl From<RevocationWire> for Revocation {
+    fn from(w: RevocationWire) -> Self {
+        Self {
+            id: w.id,
+            kind: w.kind,
+            target_id: w.target_id,
+            public_key: w.public_key,
+            issued_at: w.issued_at.unix,
+            issued_at_nanos: w.issued_at.nanos,
+            revoked_at: w.revoked_at.unix,
+            revoked_at_nanos: w.revoked_at.nanos,
+            revoked_by: w.revoked_by,
+            signer_key: w.signer_key,
+            signature: w.signature,
+        }
+    }
+}
+
+impl From<&Revocation> for RevocationWire {
+    fn from(r: &Revocation) -> Self {
+        Self {
+            id: r.id.clone(),
+            kind: r.kind.clone(),
+            target_id: r.target_id.clone(),
+            public_key: r.public_key.clone(),
+            issued_at: GoTime {
+                unix: r.issued_at,
+                nanos: r.issued_at_nanos,
+            },
+            revoked_at: GoTime {
+                unix: r.revoked_at,
+                nanos: r.revoked_at_nanos,
+            },
+            revoked_by: r.revoked_by.clone(),
+            signer_key: r.signer_key.clone(),
+            signature: r.signature.clone(),
+        }
+    }
+}
+
+impl Serialize for Revocation {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        <RevocationWire as Serialize>::serialize(&RevocationWire::from(self), s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Revocation {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The trait's reader (Go's rules), not the derive's own `RevocationWire::deserialize`.
+        <RevocationWire as Deserialize>::deserialize(d).map(Self::from)
+    }
+}
 
 /// What a revocation revokes, after its kind (`vrsta`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1028,8 +1105,21 @@ pub mod rfc3339_unix {
             .ok_or_else(|| format!("invalid RFC 3339 timestamp {s:?}"))
     }
 
+    /// Writes `text` for a time at `unix`, or fails as Go's `json.Marshal` does when the
+    /// year in UTC is outside 0 to 9999: Go has no text for such a time, and the text
+    /// written here would be read by neither side.
+    fn write_go_time<S: Serializer>(unix: i64, text: String, ser: S) -> Result<S::Ok, S::Error> {
+        // 0000-01-01T00:00:00Z to 9999-12-31T23:59:59Z; a part of a second stays in the year.
+        if !(-62_167_219_200..=253_402_300_799).contains(&unix) {
+            return Err(serde::ser::Error::custom(
+                "vrijeme izvan godina 0 do 9999 ne može se zapisati",
+            ));
+        }
+        ser.serialize_str(&text)
+    }
+
     pub fn serialize<S: Serializer>(unix: &i64, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&format_utc(*unix))
+        write_go_time(*unix, format_utc(*unix), ser)
     }
 
     /// An [`Expiry`](super::Expiry) as the wire writes it: a time, Go's zero time for no
@@ -1049,7 +1139,8 @@ pub mod rfc3339_unix {
         use serde::{Deserializer, Serializer, de};
 
         pub fn serialize<S: Serializer>(expiry: &Expiry, ser: S) -> Result<S::Ok, S::Error> {
-            ser.serialize_str(&super::format_utc_nanos(expiry.wire_unix(), expiry.nanos()))
+            let unix = expiry.wire_unix();
+            super::write_go_time(unix, super::format_utc_nanos(unix, expiry.nanos()), ser)
         }
 
         pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Expiry, D::Error> {
@@ -1076,7 +1167,7 @@ pub mod rfc3339_unix {
         use serde::{Deserializer, Serializer};
 
         pub fn serialize<S: Serializer>(t: &GoTime, ser: S) -> Result<S::Ok, S::Error> {
-            ser.serialize_str(&super::format_utc_nanos(t.unix, t.nanos))
+            super::write_go_time(t.unix, super::format_utc_nanos(t.unix, t.nanos), ser)
         }
 
         pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<GoTime, D::Error> {
@@ -1172,6 +1263,8 @@ mod tests {
             public_key: public_key_to_base64(member_vk.as_bytes()),
             issued_at: now + 20,
             revoked_at: now + 30,
+            issued_at_nanos: 0,
+            revoked_at_nanos: 0,
             revoked_by: "root".to_owned(),
             signer_key: String::new(),
             signature: String::new(),
@@ -1229,6 +1322,8 @@ mod tests {
                 public_key: member_b64.clone(),
                 issued_at: issued_at + 2,
                 revoked_at: issued_at + 2,
+                issued_at_nanos: 0,
+                revoked_at_nanos: 0,
                 revoked_by: "cvor-a".to_owned(),
                 signer_key: String::new(),
                 signature: String::new(),
@@ -1517,6 +1612,8 @@ mod tests {
             public_key: public_key_to_base64(sk_b.verifying_key().as_bytes()),
             issued_at: now,
             revoked_at: now + 60,
+            issued_at_nanos: 0,
+            revoked_at_nanos: 0,
             revoked_by: "root".into(),
             signer_key: String::new(),
             signature: String::new(),
@@ -1691,6 +1788,8 @@ mod tests {
                 public_key: subject.into(),
                 issued_at: AT,
                 revoked_at: AT + 3600,
+                issued_at_nanos: 0,
+                revoked_at_nanos: 0,
                 revoked_by: "admin-1".into(),
                 signer_key: signer_key.into(),
                 signature: String::new(),
@@ -2046,6 +2145,8 @@ mod tests {
                 public_key: b64(&member().verifying_key()),
                 issued_at: AT,
                 revoked_at: AT + 3600,
+                issued_at_nanos: 0,
+                revoked_at_nanos: 0,
                 revoked_by: "admin-1".into(),
                 signer_key: b64(&signer().verifying_key()),
                 signature: String::new(),
@@ -2527,6 +2628,8 @@ mod tests {
                 public_key: b64(&key(5)),
                 issued_at: AT,
                 revoked_at: AT + 3600,
+                issued_at_nanos: 0,
+                revoked_at_nanos: 0,
                 revoked_by: "admin-1".into(),
                 signer_key: String::new(),
                 signature: String::new(),
@@ -2552,6 +2655,8 @@ mod tests {
                         public_key: String::new(),
                         issued_at: Z,
                         revoked_at: Z,
+                        issued_at_nanos: 0,
+                        revoked_at_nanos: 0,
                         revoked_by: String::new(),
                         signer_key: String::new(),
                         signature: String::new(),
@@ -2915,26 +3020,37 @@ mod records_as_in_go {
     /// (record: `o` ovlast, `m` membership, `r` revocation; JSON text; what Go reads;
     /// what Rust does). Rust: `isto` reads the same, `GRESKA` refuses where Go reads.
     ///
-    /// Rust refuses in two cases only. A kept `expiresAt` that is Go's zero time with a
+    /// Rust refuses in one case only: a kept `expiresAt` that is Go's zero time with a
     /// part of a second (Go: `zero=false`) is a bad record (see
-    /// [`rfc3339_unix::expiry`]). A lone surrogate escape (`\ud800`) in a text Go reads
-    /// as U+FFFD, and serde does not read it at all.
+    /// [`rfc3339_unix::expiry`]). A lone surrogate escape (`\ud800`) is U+FFFD, as in Go
+    /// ([`crate::wire::go_text`]).
     ///
     /// Rows checked against Go besides these: 10,000 and 12,000 random records with keys
     /// in other cases, with `K`/`ſ`, the old Rust names, repeats, `null` and bad values;
     /// all read the same, but for the zero time with a part of a second.
     const EDGES: &[(&str, &str, &str, &str)] = &[
+        // A control character written as it is in a key is an error, as in Go; as an
+        // escape it is a key that names no field.
+        ("o", "{\"deviceId\":\"d\",\"a\u{1}b\":1}", "GRESKA", "isto"),
+        ("r", "{\"vrsta\":\"x\",\"a\nb\":1}", "GRESKA", "isto"),
+        ("m", "{\"primatelj\":{\"\u{4}\":1}}", "GRESKA", "isto"),
+        (
+            "r",
+            r#"{"vrsta":"x","a\u0001b":1,"\u0000":2}"#,
+            r#"id="" vrsta="x" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "isto",
+        ),
         (
             "r",
             r#"{"vrsta":"\ud800"}"#,
             r#"id="" vrsta="�" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
-            "GRESKA",
+            "isto",
         ),
         (
             "r",
             r#"{"vrsta":"a\udc00b"}"#,
             r#"id="" vrsta="a�b" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
-            "GRESKA",
+            "isto",
         ),
         (
             "o",
@@ -2946,7 +3062,7 @@ mod records_as_in_go {
             "m",
             r#"{"primatelj":{"network":"\ud800"}}"#,
             r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="�" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
-            "GRESKA",
+            "isto",
         ),
         (
             "r",
@@ -3156,6 +3272,174 @@ mod records_as_in_go {
         ),
     ];
 
+    /// What Go (go1.27.1) writes and takes. A revocation it signs over whole seconds, and
+    /// the same one with a part of a second added on the way: Go still takes it as valid
+    /// on its own, with the same id, and writes the times back in full (`json.Marshal`
+    /// after `.UTC()`, as it stores them). Rust does the same.
+    const GO_REVOCATION: &str = r#"{"id":"clanstvo:pk:1760000000:142e0c655ee4b74f","vrsta":"clanstvo","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20Z","opozvanoAt":"2025-10-09T08:54:20Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"txKWoyQ8GlnzZJBgmSMUEvWFsOVW7IMxuC9qJMNtx6IvEMIZmkYRbyY9dHeHGpP/OF+2w1CPLxiRrOSprKwrCg=="}"#;
+    const GO_REVOCATION_PARTS: &[(&str, &str)] = &[
+        (
+            r#"{"id":"clanstvo:pk:1760000000:142e0c655ee4b74f","vrsta":"clanstvo","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20.25Z","opozvanoAt":"2025-10-09T10:54:20.5+02:00","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"txKWoyQ8GlnzZJBgmSMUEvWFsOVW7IMxuC9qJMNtx6IvEMIZmkYRbyY9dHeHGpP/OF+2w1CPLxiRrOSprKwrCg=="}"#,
+            r#"{"id":"clanstvo:pk:1760000000:142e0c655ee4b74f","vrsta":"clanstvo","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20.25Z","opozvanoAt":"2025-10-09T08:54:20.5Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"txKWoyQ8GlnzZJBgmSMUEvWFsOVW7IMxuC9qJMNtx6IvEMIZmkYRbyY9dHeHGpP/OF+2w1CPLxiRrOSprKwrCg=="}"#,
+        ),
+        (
+            r#"{"id":"clanstvo:pk:1760000000:142e0c655ee4b74f","vrsta":"clanstvo","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20.999999999Z","opozvanoAt":"2025-10-09T08:54:20Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"txKWoyQ8GlnzZJBgmSMUEvWFsOVW7IMxuC9qJMNtx6IvEMIZmkYRbyY9dHeHGpP/OF+2w1CPLxiRrOSprKwrCg=="}"#,
+            r#"{"id":"clanstvo:pk:1760000000:142e0c655ee4b74f","vrsta":"clanstvo","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20.999999999Z","opozvanoAt":"2025-10-09T08:54:20Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"txKWoyQ8GlnzZJBgmSMUEvWFsOVW7IMxuC9qJMNtx6IvEMIZmkYRbyY9dHeHGpP/OF+2w1CPLxiRrOSprKwrCg=="}"#,
+        ),
+    ];
+
+    #[test]
+    fn revocation_times_keep_their_part_of_a_second() {
+        let whole: Revocation = serde_json::from_str(GO_REVOCATION).unwrap();
+        assert!(whole.verify_self().is_ok());
+        assert_eq!(to_go_json_vec(&whole).unwrap(), GO_REVOCATION.as_bytes());
+        for (wire, go_writes) in GO_REVOCATION_PARTS {
+            let r: Revocation = serde_json::from_str(wire).unwrap();
+            assert!(r.verify_self().is_ok(), "{wire}");
+            assert_eq!(r.signed_bytes(), whole.signed_bytes());
+            assert_eq!(r.compute_id(), whole.compute_id());
+            assert_eq!(
+                String::from_utf8(to_go_json_vec(&r).unwrap()).unwrap(),
+                *go_writes
+            );
+        }
+        let r: Revocation = serde_json::from_str(GO_REVOCATION_PARTS[0].0).unwrap();
+        assert_eq!(
+            (r.issued_at, r.issued_at_nanos),
+            (1_760_000_000, 250_000_000)
+        );
+        assert_eq!(
+            (r.revoked_at, r.revoked_at_nanos),
+            (1_760_000_060, 500_000_000)
+        );
+        // Go decides on whole seconds: what was issued in that second is revoked.
+        assert!(r.revokes("pk", 1_760_000_000));
+        assert!(!r.revokes("pk", 1_760_000_001));
+    }
+
+    /// Go signs a revocation whose kind holds U+FFFD and writes it as its three bytes.
+    /// On the way it can come as a lone surrogate escape or as a byte that is not UTF-8:
+    /// Go reads both as U+FFFD and takes the revocation as valid on its own, as it takes
+    /// an ovlast with `\ud800` in its device. The signed bytes in Rust are Go's.
+    const GO_FFFD_REVOCATION: &str = r#"{"id":"a�b:pk:1760000000:5d389d2469242027","vrsta":"a�b","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20Z","opozvanoAt":"2025-10-09T08:53:20Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"Pp8hoPmdQnFG6yaxatQ0oa5D/ImXbS6qTzoP5/QTahJzSXXS08vrjACqD0OCddn1vBSvgUYlGdzUG+ZZgNsFDQ=="}"#;
+    const GO_LONE_SURROGATE_REVOCATION: &str = r#"{"id":"a\udc00b:pk:1760000000:5d389d2469242027","vrsta":"a�b","nodeId":"uredaj","publicKey":"pk","issuedAt":"2025-10-09T08:53:20Z","opozvanoAt":"2025-10-09T08:53:20Z","opozvao":"admin","potpisnik":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=","potpis":"Pp8hoPmdQnFG6yaxatQ0oa5D/ImXbS6qTzoP5/QTahJzSXXS08vrjACqD0OCddn1vBSvgUYlGdzUG+ZZgNsFDQ=="}"#;
+    const GO_LONE_SURROGATE_OVLAST: &str = r#"{"network":"/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=","deviceId":"\ud800","deviceKey":"7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=","issuedBy":"korijen","issuedAt":"2025-10-09T08:53:20Z","expiresAt":"2025-10-09T09:53:20Z","signature":"4cI8bFR31vn0QgYNTIf6eg2twTRpKeBYtq3cF8o6cKhYmrSjii6c8UijxAb+I/Im53Uh6XnQacf9qE0a3c42DQ=="}"#;
+
+    #[test]
+    fn text_go_reads_as_fffd_keeps_the_signature() {
+        let go: Revocation = serde_json::from_str(GO_FFFD_REVOCATION).unwrap();
+        assert!(go.verify_self().is_ok());
+        assert_eq!(go.kind, "a\u{FFFD}b");
+        let lone: Revocation = serde_json::from_str(GO_LONE_SURROGATE_REVOCATION).unwrap();
+        let not_utf8 = GO_FFFD_REVOCATION
+            .as_bytes()
+            .windows(3)
+            .position(|w| w == "\u{FFFD}".as_bytes())
+            .map(|i| {
+                let mut b = GO_FFFD_REVOCATION.as_bytes().to_vec();
+                b.splice(i..i + 3, [0xff]);
+                b
+            })
+            .unwrap();
+        let not_utf8: Revocation = crate::wire::go_text::from_slice(&not_utf8).unwrap();
+        for r in [&lone, &not_utf8] {
+            assert_eq!(r, &go);
+            assert!(r.verify_self().is_ok());
+        }
+        assert!(serde_json::from_slice::<Revocation>(GO_FFFD_REVOCATION.as_bytes()).is_ok());
+
+        let o: Ovlast = serde_json::from_str(GO_LONE_SURROGATE_OVLAST).unwrap();
+        assert_eq!(o.device_id, "\u{FFFD}");
+        let network = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        assert_eq!(o.verify(&network, 1_760_000_060), Ok(()));
+    }
+
+    /// (record, time field, time on the wire, what Go's `json.Marshal` writes for it).
+    /// Go column: go1.27.1, `json.Unmarshal` and then `json.Marshal` of the record with
+    /// its times in UTC. Go reads all of these, but writes a time only in years 0 to 9999
+    /// in UTC; for any other, `json.Marshal` fails (`MARSHALERR`).
+    const TIMES_GO_WRITES: &[(&str, &str, &str, &str)] = &[
+        ("o", "issuedAt", "9999-12-31T23:59:59-01:00", "MARSHALERR"),
+        (
+            "o",
+            "expiresAt",
+            "9999-12-31T23:59:59.5-01:00",
+            "MARSHALERR",
+        ),
+        ("o", "expiresAt", "0000-01-01T00:00:00+01:00", "MARSHALERR"),
+        (
+            "m",
+            "issuedAt",
+            "0000-01-01T00:00:00.25+00:01",
+            "MARSHALERR",
+        ),
+        ("p", "issuedAt", "9999-12-31T23:59:59-01:00", "MARSHALERR"),
+        ("r", "issuedAt", "0000-01-01T00:00:00+01:00", "MARSHALERR"),
+        (
+            "r",
+            "opozvanoAt",
+            "9999-12-31T23:59:59.5-01:00",
+            "MARSHALERR",
+        ),
+        (
+            "o",
+            "issuedAt",
+            "9999-12-31T23:59:59+00:00",
+            "9999-12-31T23:59:59Z",
+        ),
+        (
+            "o",
+            "expiresAt",
+            "0000-01-01T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+        ),
+        (
+            "r",
+            "opozvanoAt",
+            "9999-12-31T23:59:59+00:00",
+            "9999-12-31T23:59:59Z",
+        ),
+        (
+            "r",
+            "issuedAt",
+            "0000-01-01T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+        ),
+    ];
+
+    #[test]
+    fn times_outside_years_go_writes_fail_to_write() {
+        const O: &str = r#"{"network":"n","deviceId":"d","deviceKey":"k","issuedBy":"b","issuedAt":"2026-01-01T00:00:00Z","expiresAt":"2027-01-01T00:00:00Z","signature":"s"}"#;
+        const R: &str = r#"{"id":"i","vrsta":"ovlast","nodeId":"n","publicKey":"p","issuedAt":"2026-01-01T00:00:00Z","opozvanoAt":"2026-01-02T00:00:00Z","opozvao":"o","potpisnik":"q","potpis":"AA=="}"#;
+        for (record, field, wire, go) in TIMES_GO_WRITES {
+            let set = |text: &str| {
+                let start = text.find(&format!("\"{field}\":\"")).unwrap() + field.len() + 4;
+                let end = start + text[start..].find('"').unwrap();
+                format!("{}{wire}{}", &text[..start], &text[end..])
+            };
+            let written = match *record {
+                "o" => to_go_json_vec(&serde_json::from_str::<Ovlast>(&set(O)).unwrap()),
+                "m" | "p" => {
+                    let (m, p) = if *record == "m" {
+                        (set(O), O.to_owned())
+                    } else {
+                        (O.to_owned(), set(O))
+                    };
+                    let text = format!("{},\"primatelj\":{p}}}", &m[..m.len() - 1]);
+                    to_go_json_vec(&serde_json::from_str::<Membership>(&text).unwrap())
+                }
+                _ => to_go_json_vec(&serde_json::from_str::<Revocation>(&set(R)).unwrap()),
+            };
+            match written {
+                Ok(text) => {
+                    let text = String::from_utf8(text).unwrap();
+                    assert!(text.contains(&format!("\"{field}\":\"{go}\"")), "{text}");
+                }
+                Err(_) => assert_eq!(*go, "MARSHALERR", "{record} {field} {wire}"),
+            }
+        }
+    }
+
     #[test]
     fn records_read_as_in_go() {
         for (kind, text, go, rust) in EDGES {
@@ -3185,6 +3469,8 @@ mod records_as_in_go {
             public_key: "pk".into(),
             issued_at: 1_760_000_000,
             revoked_at: 1_760_000_100,
+            issued_at_nanos: 0,
+            revoked_at_nanos: 0,
             revoked_by: "o".into(),
             signer_key: String::new(),
             signature: String::new(),
