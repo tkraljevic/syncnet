@@ -23,7 +23,7 @@
 //! a new element leaves nothing of the old one; a [`Kind::StructSlice`] field must keep
 //! it that way.
 //!
-//! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and [`go_struct!`]
+//! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and `go_struct!`
 //! puts this reader in front of it: keys are mapped to field names, repeats are settled,
 //! and the derive reads the result.
 
