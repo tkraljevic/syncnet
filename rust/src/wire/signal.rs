@@ -1,5 +1,7 @@
 use crate::identity::{parse_public_key_bytes, public_key_to_base64};
+use crate::wire::go_bytes;
 use crate::wire::go_json::to_go_json_vec;
+use crate::wire::go_object::{Field, Kind, Schema, go_struct};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -13,6 +15,8 @@ pub const SIGNAL_MAX_SKEW_SECS: i64 = 600;
 pub const SIGNAL_REPLAY_CACHE_MAX: usize = 8192;
 pub const SIGNAL_MAX_SINKRO_ATTEMPT: i64 = 3;
 
+/// Strict base64 for the v2 bundle sketch, which has no Go counterpart yet. Signal fields
+/// are read as Go reads them, through [`go_bytes`].
 pub mod base64_bytes {
     use super::*;
 
@@ -31,34 +35,6 @@ pub mod base64_bytes {
         STANDARD
             .decode(s.as_bytes())
             .map_err(serde::de::Error::custom)
-    }
-}
-
-pub mod opt_base64_bytes {
-    use super::*;
-
-    pub fn serialize<S>(opt: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match opt {
-            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        match opt {
-            Some(s) => STANDARD
-                .decode(s.as_bytes())
-                .map(Some)
-                .map_err(serde::de::Error::custom),
-            None => Ok(None),
-        }
     }
 }
 
@@ -95,19 +71,33 @@ impl std::error::Error for SignalError {}
 /// Go always writes both fields, so a missing one (e.g. the old `{"kind","addr"}` shape)
 /// is rejected instead of silently becoming an empty string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct CandidateAddr {
     pub vrsta: String,
     pub adresa: String,
 }
 
+pub(crate) const CANDIDATE_SCHEMA: Schema = Schema {
+    fields: &[Field::value("vrsta"), Field::value("adresa")],
+    baseline: &[("vrsta", "\"\""), ("adresa", "\"\"")],
+};
+go_struct!(CandidateAddr, CANDIDATE_SCHEMA);
+
 /// Sender's NAT report (`NATPoruke` in goCOP: `{"vrsta","udpBlokiran"}`, both omitted when empty).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct NatReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vrsta: String,
     #[serde(rename = "udpBlokiran", default, skip_serializing_if = "is_false")]
     pub udp_blokiran: bool,
 }
+
+pub(crate) const NAT_SCHEMA: Schema = Schema {
+    fields: &[Field::value("vrsta"), Field::value("udpBlokiran")],
+    baseline: &[],
+};
+go_struct!(NatReport, NAT_SCHEMA);
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -136,8 +126,10 @@ where
     Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
 }
 
+/// Field names are read as Go reads them (see [`crate::wire::go_object`]): in any ASCII
+/// case, and a field given twice counts the last time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub struct SignalBody {
     /// Numbers are Go `int`, 64 bits on 64-bit platforms (a 32-bit Go build would already
     /// refuse values past 2^31 when it reads them): Go reads any of them, negative ones
@@ -155,7 +147,7 @@ pub struct SignalBody {
     pub izdano: i64,
     #[serde(
         default,
-        with = "opt_base64_bytes",
+        with = "go_bytes::opt",
         skip_serializing_if = "is_none_or_empty_bytes"
     )]
     pub tajna: Option<Vec<u8>>,
@@ -175,21 +167,60 @@ pub struct SignalBody {
     pub rtt_ms: Option<i64>,
     #[serde(
         default,
-        with = "opt_base64_bytes",
+        with = "go_bytes::opt",
         skip_serializing_if = "is_none_or_empty_bytes"
     )]
     pub vj: Option<Vec<u8>>,
 }
 
+pub(crate) const BODY_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("ver"),
+        Field::value("sesija"),
+        Field::value("od"),
+        Field::value("za"),
+        Field::value("sastajaliste"),
+        Field::value("izdano"),
+        Field::nullable("tajna"),
+        Field::new("kandidati", Kind::StructSlice),
+        Field::new("nat", Kind::Struct),
+        Field::value("odluka"),
+        Field::value("razlog"),
+        Field::value("obradaMs"),
+        Field::value("pokusaj"),
+        Field::value("rttMs"),
+        Field::nullable("vj"),
+    ],
+    baseline: &[
+        ("ver", "1"),
+        ("sesija", "\"\""),
+        ("od", "\"\""),
+        ("za", "\"\""),
+        ("sastajaliste", "\"\""),
+        ("izdano", "0"),
+    ],
+};
+go_struct!(SignalBody, BODY_SCHEMA);
+
+/// Read as Go reads the signed message: field names in any ASCII case, the last of a
+/// repeated field, and a missing field as no bytes, which the checks then refuse as Go's
+/// do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct SignedSignalMessage {
     #[serde(skip)]
     pub kind: String,
-    #[serde(with = "base64_bytes")]
+    #[serde(default, with = "go_bytes")]
     pub tijelo: Vec<u8>,
-    #[serde(with = "base64_bytes")]
+    #[serde(default, with = "go_bytes")]
     pub potpis: Vec<u8>,
 }
+
+pub(crate) const SIGNED_SCHEMA: Schema = Schema {
+    fields: &[Field::nullable("tijelo"), Field::nullable("potpis")],
+    baseline: &[],
+};
+go_struct!(SignedSignalMessage, SIGNED_SCHEMA);
 
 pub fn signal_signing_prefix(protocol: &str, kind: &str) -> Vec<u8> {
     format!("{protocol}-{kind}-v1|").into_bytes()
@@ -745,5 +776,128 @@ mod tests {
             &mut cache,
         ));
         assert_eq!((first.as_str(), second.as_str()), ("prima", "prima"));
+    }
+
+    /// The signed message as it comes off the wire, with `potpis`, `tijelo`, `tajna` and
+    /// `vj` written in shapes that Go's `encoding/json` reads into the same bytes (see the
+    /// table in `wire::go_bytes`, measured in Go): base64 with a line break, extra bits in
+    /// the last character, or an array of numbers. Each must verify as the plain message
+    /// does; a shape Go refuses must not.
+    #[test]
+    fn signal_fields_read_as_go_reads_bytes() {
+        let sender = SigningKey::from_bytes(&[5; 32]);
+        let me = SigningKey::from_bytes(&[6; 32]);
+        let rendezvous = SigningKey::from_bytes(&[7; 32]);
+        let at = 1_760_000_000i64;
+        let body = SignalBody {
+            ver: 1,
+            sesija: "00112233445566778899aabbccddeeff".into(),
+            od: public_key_to_base64(sender.verifying_key().as_bytes()),
+            za: public_key_to_base64(me.verifying_key().as_bytes()),
+            sastajaliste: public_key_to_base64(rendezvous.verifying_key().as_bytes()),
+            izdano: at,
+            tajna: Some(vec![0x42; 32]),
+            kandidati: vec![],
+            nat: None,
+            odluka: None,
+            razlog: None,
+            obrada_ms: None,
+            pokusaj: None,
+            rtt_ms: None,
+            vj: Some(vec![1, 2, 3]),
+        };
+        let plain = String::from_utf8(to_go_json_vec(&body).unwrap()).unwrap();
+        let tajna = STANDARD.encode([0x42u8; 32]);
+        let tijela = [
+            plain.clone(),
+            plain.replace(&tajna, &format!("{}\\n{}", &tajna[..20], &tajna[20..])),
+            plain.replace(r#""vj":"AQID""#, r#""vj":[1,2,3]"#),
+            plain.replace(
+                &format!(r#""{tajna}""#),
+                &format!("{:?}", [0x42u8; 32]).replace(' ', ""),
+            ),
+        ];
+        for (i, tijelo) in tijela.iter().enumerate() {
+            assert_eq!(i == 0, *tijelo == plain, "{tijelo}");
+            let mut signed = signal_signing_prefix("gocop", SIGNAL_KIND_POZIV);
+            signed.extend_from_slice(tijelo.as_bytes());
+            let potpis = STANDARD.encode(sender.sign(&signed).to_bytes());
+            let tijelo_b64 = STANDARD.encode(tijelo.as_bytes());
+            // The last character of a 64-byte signature carries 2 bits and 4 extra ones.
+            let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let last = alphabet.find(potpis.as_bytes()[85] as char).unwrap();
+            let loose = alphabet.as_bytes()[last ^ 0b1111] as char;
+            let bytes_arr = |b: &[u8]| format!("{b:?}").replace(' ', "");
+            let raw_sig = sender.sign(&signed).to_bytes();
+            let cases = [
+                (tijelo_b64.clone(), potpis.clone(), true),
+                (
+                    tijelo_b64.clone(),
+                    format!("{}\\r\\n{}", &potpis[..76], &potpis[76..]),
+                    true,
+                ),
+                (
+                    tijelo_b64.clone(),
+                    format!("{}{loose}==", &potpis[..85]),
+                    true,
+                ),
+                (
+                    format!("{}\\n{}", &tijelo_b64[..10], &tijelo_b64[10..]),
+                    potpis.clone(),
+                    true,
+                ),
+                (
+                    tijelo_b64.clone(),
+                    potpis.trim_end_matches('=').to_owned(),
+                    false,
+                ),
+                (format!(" {tijelo_b64}"), potpis.clone(), false),
+            ];
+            let mut wires: Vec<(String, bool)> = cases
+                .iter()
+                .map(|(t, p, ok)| (format!(r#"{{"tijelo":"{t}","potpis":"{p}"}}"#), *ok))
+                .collect();
+            wires.push((
+                format!(
+                    r#"{{"tijelo":"{tijelo_b64}","potpis":{}}}"#,
+                    bytes_arr(&raw_sig)
+                ),
+                true,
+            ));
+            wires.push((
+                format!(
+                    r#"{{"tijelo":{},"potpis":"{potpis}"}}"#,
+                    bytes_arr(tijelo.as_bytes())
+                ),
+                true,
+            ));
+            for (wire, go_takes) in wires {
+                let msg = serde_json::from_str::<SignedSignalMessage>(&wire).map(|mut m| {
+                    m.kind = SIGNAL_KIND_POZIV.into();
+                    m
+                });
+                let got = msg.ok().and_then(|m| {
+                    verify_signed_signal(
+                        "gocop",
+                        &m,
+                        &me.verifying_key(),
+                        &rendezvous.verifying_key(),
+                        at,
+                        &mut ReplayCache::default(),
+                        |_, _| true,
+                    )
+                    .ok()
+                });
+                assert_eq!(got.is_some(), go_takes, "{wire}");
+                if let Some(read) = got {
+                    assert_eq!(
+                        read.tajna.as_deref(),
+                        Some([0x42u8; 32].as_slice()),
+                        "{wire}"
+                    );
+                    assert_eq!(read.vj.as_deref(), Some([1u8, 2, 3].as_slice()), "{wire}");
+                }
+            }
+        }
     }
 }
