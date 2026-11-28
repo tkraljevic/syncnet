@@ -211,7 +211,7 @@ bajtovima -62135596800) znači da zapis ne ističe. Samo to vrijeme znači
 „bez isteka”: `1970-01-01` i ranija vremena znače da je zapis davno
 istekao. Članstvo bez isteka koje je izdao ovlašteni primatelj traje dulje
 od svake ovlasti koja ističe. Da je `expiresAt` prije `issuedAt`, ne
-provjerava se; takav zapis je samo istekao.
+provjerava se: i takav zapis vrijedi do svog `expiresAt`, kao svaki drugi.
 
 Članstvo vrijedi kad: potpis vrijedi, mreža je prava, ključ računala je
 onaj koji je dokazan u TLS-u, nije opozvano i nije isteklo. Isteklo
