@@ -181,8 +181,9 @@ pub fn verify_version_signature(
 }
 
 /// The time of a version as Go reads its `created_at` (a `time.Time`, see
-/// [`go_time`]): the text is already unescaped, as Go unescapes it first. Where Go fails
-/// to read the time it turns the version away, so here it is [`BadCreatedAt`]. The
+/// [`go_time`]): the text is already unescaped, as Go unescapes it first. A version read
+/// from the wire always has such a time ([`VersionV1`] refuses any other, and with it the
+/// message, as Go does), so [`BadCreatedAt`] is only for a version built by hand. The
 /// signature covers whole seconds, so a part of a second does not count.
 ///
 /// [`BadCreatedAt`]: VersionSignatureError::BadCreatedAt

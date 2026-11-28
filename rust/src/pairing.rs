@@ -5,7 +5,8 @@ use crate::{
         conversation_v1::{ConversationV1Error, read_line_bytes},
         frame::{FrameError, read_frame_async, write_frame_async},
         go_bytes,
-        go_object::{Field, Schema, go_struct},
+        go_object::{Field, Schema, go_struct, object_only},
+        go_text,
     },
 };
 use ed25519_dalek::SigningKey;
@@ -112,6 +113,7 @@ impl PairIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct PairHello {
     pub protocol: String,
     #[serde(rename = "deviceId")]
@@ -149,11 +151,15 @@ pub(crate) const SAS_SCHEMA: Schema = Schema {
 go_struct!(SasWireMessage, SAS_SCHEMA);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct PairConfirm {
     pub approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
+
+// Go reads these as structs: from an object, `null` as `{}`, never from an array.
+object_only!(PairHello, PairConfirm);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairFinishResult {
@@ -352,8 +358,8 @@ where
     write_pairing_msg(stream, &step1_bytes, MAX_SAS_MSG_LEN, line_json).await?;
 
     let reply_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
-    let reply: SasWireMessage = serde_json::from_slice(&reply_raw)
-        .map_err(|e| PairingError::Serialization(e.to_string()))?;
+    let reply: SasWireMessage =
+        go_text::from_slice(&reply_raw).map_err(|e| PairingError::Serialization(e.to_string()))?;
     // As in Go, each step looks only at the length of the field it needs; the other one
     // may come along.
     let Some(listener_vec) = reply.broj else {
@@ -395,8 +401,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let commit_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
-    let commit_msg: SasWireMessage = serde_json::from_slice(&commit_raw)
-        .map_err(|e| PairingError::Serialization(e.to_string()))?;
+    let commit_msg: SasWireMessage =
+        go_text::from_slice(&commit_raw).map_err(|e| PairingError::Serialization(e.to_string()))?;
     let Some(commit_vec) = commit_msg.obveza else {
         return Err(PairingError::InvalidCommit);
     };
@@ -413,8 +419,8 @@ where
     write_pairing_msg(stream, &step2_bytes, MAX_SAS_MSG_LEN, line_json).await?;
 
     let reveal_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
-    let reveal_msg: SasWireMessage = serde_json::from_slice(&reveal_raw)
-        .map_err(|e| PairingError::Serialization(e.to_string()))?;
+    let reveal_msg: SasWireMessage =
+        go_text::from_slice(&reveal_raw).map_err(|e| PairingError::Serialization(e.to_string()))?;
     let Some(caller_vec) = reveal_msg.broj else {
         return Err(PairingError::InvalidCommit);
     };
@@ -945,6 +951,32 @@ mod tests {
     use super::*;
     use crate::identity::generate_signing_key;
     use serde_json::json;
+
+    /// (message, JSON text, what Go does). Go column: go1.27.1, `json.Unmarshal` into the
+    /// Go side's hello and confirmation. Go reads them only from an object; `null` leaves
+    /// them empty, where Rust, as for `{}`, requires the fields.
+    #[test]
+    fn pairing_messages_read_only_from_objects_as_in_go() {
+        for (kind, text, go) in [
+            ("hello", "[]", "GRESKA"),
+            ("hello", r#"["p","d","n","v"]"#, "GRESKA"),
+            (
+                "hello",
+                r#"{"protocol":"p","deviceId":"d","name":"n","version":"v"}"#,
+                "OK",
+            ),
+            ("confirm", "[]", "GRESKA"),
+            ("confirm", "[true]", "GRESKA"),
+            ("confirm", r#"{"approved":true}"#, "OK"),
+        ] {
+            let got = if kind == "hello" {
+                serde_json::from_str::<PairHello>(text).is_ok()
+            } else {
+                serde_json::from_str::<PairConfirm>(text).is_ok()
+            };
+            assert_eq!(got, go == "OK", "{kind} {text}");
+        }
+    }
 
     #[test]
     fn sas_code_is_order_independent_for_keys_and_order_dependent_for_nonces() {
