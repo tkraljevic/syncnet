@@ -56,8 +56,9 @@ pub struct VersionData<'a> {
     pub channel: &'a str,
     pub schema_version: i64,
     pub created_at_unix: i64,
-    /// The payload as JSON text, in any spacing.
-    pub payload: &'a str,
+    /// The payload as JSON text, in any spacing, byte for byte as it came (Go keeps bytes
+    /// that are not UTF-8 in it, and so does the digest).
+    pub payload: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +113,8 @@ pub fn version_signing_prefix(protocol: &str) -> String {
 }
 
 /// Hex SHA-256 of the payload in the shape it has on the wire.
-pub fn payload_digest(payload: &str) -> Result<String, VersionSignatureError> {
-    let wire = go_raw_json_vec(payload).map_err(|_| VersionSignatureError::PayloadNotJson)?;
+pub fn payload_digest(payload: &[u8]) -> Result<String, VersionSignatureError> {
+    let wire = go_raw_json_vec(payload).ok_or(VersionSignatureError::PayloadNotJson)?;
     Ok(hex::encode(Sha256::digest(wire)))
 }
 
@@ -209,9 +210,9 @@ pub fn verify_version_v1(protocol: &str, version: &VersionV1) -> Result<(), Vers
         supersedes: &version.supersedes,
         archived: version.archived,
         channel: version.channel.as_deref().unwrap_or(""),
-        schema_version: i64::from(version.schema_version),
+        schema_version: version.schema_version,
         created_at_unix: created_at_unix(&version.created_at)?,
-        payload: version.payload.get(),
+        payload: version.payload.as_bytes(),
     };
     verify_version_signature(protocol, &data, &version.potpis, &version.kljuc_autora)
 }
@@ -263,7 +264,7 @@ mod tests {
                 channel: input("channel"),
                 schema_version: vector["ulaz"]["schema_version"].as_i64().unwrap(),
                 created_at_unix: created_at_unix(input("created_at")).unwrap(),
-                payload: input("payload"),
+                payload: input("payload").as_bytes(),
             };
 
             assert_eq!(
@@ -307,7 +308,7 @@ mod tests {
                     ..data
                 },
                 VersionData {
-                    payload: r#"{"drugo":1}"#,
+                    payload: br#"{"drugo":1}"#,
                     ..data
                 },
             ] {
@@ -348,9 +349,9 @@ mod tests {
                 node_id: text("node_id"),
                 supersedes: text("supersedes"),
                 archived: plain["archived"].as_bool().unwrap(),
-                payload: serde_json::value::RawValue::from_string(text("payload")).unwrap(),
+                payload: crate::wire::go_raw::RawJson::from_bytes(text("payload")),
                 created_at: text("created_at"),
-                schema_version: u32::try_from(plain["schema_version"].as_u64().unwrap()).unwrap(),
+                schema_version: plain["schema_version"].as_i64().unwrap(),
                 channel: Some(text("channel")).filter(|c| !c.is_empty()),
                 potpis: field("potpis").to_owned(),
                 kljuc_autora: field("kljuc_autora").to_owned(),
@@ -375,14 +376,17 @@ mod tests {
         let spaced = "{ \"a\" : [ 1 , \"b c\" ] ,\n\t\"d\" : \"<\u{2028}>\" }";
         let compact = r#"{"a":[1,"b c"],"d":"\u003c\u2028\u003e"}"#;
         assert_eq!(
-            String::from_utf8(go_raw_json_vec(spaced).unwrap()).unwrap(),
+            String::from_utf8(go_raw_json_vec(spaced.as_bytes()).unwrap()).unwrap(),
             compact
         );
-        assert_eq!(payload_digest(spaced), payload_digest(compact));
+        assert_eq!(
+            payload_digest(spaced.as_bytes()),
+            payload_digest(compact.as_bytes())
+        );
 
         for not_json in ["", "{", "{} {}", "nije json"] {
             assert_eq!(
-                payload_digest(not_json),
+                payload_digest(not_json.as_bytes()),
                 Err(VersionSignatureError::PayloadNotJson),
                 "{not_json:?}"
             );
@@ -398,10 +402,9 @@ mod tests {
             node_id: "admin-1".into(),
             supersedes: String::new(),
             archived: false,
-            payload: serde_json::value::RawValue::from_string(
-                r#"{"full_name":"Ana Horvat","username":"ahorvat"}"#.to_owned(),
-            )
-            .unwrap(),
+            payload: crate::wire::go_raw::RawJson::from_bytes(
+                r#"{"full_name":"Ana Horvat","username":"ahorvat"}"#,
+            ),
             created_at: "2025-10-09T08:53:20Z".into(),
             schema_version: 1,
             channel: None,
@@ -423,7 +426,7 @@ mod tests {
             channel: "",
             schema_version: 1,
             created_at_unix: 1_760_000_000,
-            payload: version.payload.get(),
+            payload: version.payload.as_bytes(),
         };
         let bytes = version_signing_bytes("gocop", &data, kljuc_autora).unwrap();
         STANDARD.encode(author.sign(&bytes).to_bytes())
@@ -598,7 +601,7 @@ mod tests {
             channel: "",
             schema_version: 1,
             created_at_unix: 0,
-            payload: "nije json",
+            payload: b"nije json",
         };
         for (key, want) in [
             (k31.as_str(), VersionSignatureError::BadAuthorKey),

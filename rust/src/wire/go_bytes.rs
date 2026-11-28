@@ -11,6 +11,11 @@
 //! Anything else is an error, as in Go: `1.0`, `1e0`, `-0`, numbers over 255, `true`,
 //! strings or arrays inside the array, objects. Writing is unchanged: always a base64
 //! string with padding.
+//!
+//! When such a field comes more than once in an object, Go reads each value into the bytes
+//! the field already holds: a base64 string and an array write over the old
+//! bytes from the start, an element `null` leaves the old byte, and bytes past the end of a
+//! shorter value come back when a later array is longer. `null` and `[]` start again.
 
 use crate::wire::go_base64::decode_std;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -147,6 +152,178 @@ impl<'de> Visitor<'de> for GoByteVisitor {
     }
 }
 
+/// The bytes Go leaves in a `[]byte` field read from `values`, one after another, each as
+/// its JSON text (lone surrogates and bytes that are not UTF-8 already read as Go reads
+/// them): `None` when the field ends as Go's nil slice (`null`, or no value at all), else
+/// the field as a base64 string. Measured with go1.27.1:
+///
+/// - a base64 string is decoded into the bytes the field holds, as
+///   `base64.StdEncoding.AppendDecode(old[:0], text)` writes them ([`go_decode_into`]); the
+///   field is as long as the decoded bytes, and the old bytes past them stay in its buffer;
+/// - an array writes element `i` over byte `i`; a `null` element leaves byte `i` as it was in
+///   the buffer (0 where nothing was ever written); the field is as long as the array;
+/// - `null` and `[]` start a new, empty buffer; `""` keeps the old one.
+///
+/// Every value has already been checked to read as a `[]byte`.
+pub(crate) fn merged(values: &[&str]) -> Result<Option<String>, String> {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut len = 0;
+    let mut nil = true;
+    for text in values {
+        let text = text.trim_matches([' ', '\t', '\n', '\r']);
+        if text == "null" {
+            buffer.clear();
+            (len, nil) = (0, true);
+        } else if text.starts_with('[') {
+            let elements: Vec<Box<serde_json::value::RawValue>> =
+                serde_json::from_str(text).map_err(|e| e.to_string())?;
+            if elements.is_empty() {
+                buffer.clear();
+            }
+            for (i, element) in elements.iter().enumerate() {
+                if i == buffer.len() {
+                    buffer.push(0);
+                }
+                if element.get() != "null" {
+                    let GoByte(b) =
+                        serde_json::from_str(element.get()).map_err(|e| e.to_string())?;
+                    buffer[i] = b;
+                }
+            }
+            (len, nil) = (elements.len(), false);
+        } else {
+            let s: String = serde_json::from_str(text).map_err(|e| e.to_string())?;
+            len = go_decode_into(&mut buffer, s.as_bytes())
+                .ok_or_else(|| "base64 koji Go ne čita".to_owned())?;
+            nil = false;
+        }
+    }
+    if nil {
+        return Ok(values.last().map(|_| "null".to_owned()));
+    }
+    buffer.resize(buffer.len().max(len), 0);
+    Ok(Some(format!("\"{}\"", STANDARD.encode(&buffer[..len]))))
+}
+
+/// Go's `base64.StdEncoding.AppendDecode(buffer[:0], src)` on a 64-bit machine: how many
+/// bytes it decodes into the start of `buffer`, or `None` for an error. It writes as Go's
+/// `Decode` writes: eight characters at a time put eight bytes (six of them decoded, two
+/// zero) and four at a time four (three and a zero), and the next step writes over the
+/// zeros. Where a line break makes the text decode to fewer bytes than its length
+/// promises, the last zeros stay and cover old bytes, as in Go. `buffer` grows with zeros
+/// to the length Go reserves.
+fn go_decode_into(buffer: &mut Vec<u8>, src: &[u8]) -> Option<usize> {
+    let unpadded = src.len() - src.iter().rev().take_while(|&&c| c == b'=').count();
+    let room = unpadded / 4 * 3 + unpadded % 4 * 6 / 8;
+    if buffer.len() < room {
+        buffer.resize(room, 0);
+    }
+    let dst = &mut buffer[..room];
+    let (mut si, mut n) = (0, 0);
+    while src.len() - si >= 8 && dst.len() - n >= 8 {
+        match assemble(&src[si..si + 8]) {
+            Some(v) => {
+                dst[n..n + 8].copy_from_slice(&(v << 16).to_be_bytes());
+                n += 6;
+                si += 8;
+            }
+            None => {
+                let (next, wrote) = quantum(&mut dst[n..], src, si)?;
+                (si, n) = (next, n + wrote);
+            }
+        }
+    }
+    while src.len() - si >= 4 && dst.len() - n >= 4 {
+        match assemble(&src[si..si + 4]) {
+            Some(v) => {
+                dst[n..n + 4].copy_from_slice(&((v as u32) << 8).to_be_bytes());
+                n += 3;
+                si += 4;
+            }
+            None => {
+                let (next, wrote) = quantum(&mut dst[n..], src, si)?;
+                (si, n) = (next, n + wrote);
+            }
+        }
+    }
+    while si < src.len() {
+        let (next, wrote) = quantum(&mut dst[n..], src, si)?;
+        (si, n) = (next, n + wrote);
+    }
+    Some(n)
+}
+
+/// The value of a character of the standard alphabet.
+fn sextet(c: u8) -> Option<u64> {
+    let v = match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => return None,
+    };
+    Some(u64::from(v))
+}
+
+/// Go's `assemble64` and `assemble32`: the characters as one number, or `None` when one is
+/// not in the alphabet.
+fn assemble(chars: &[u8]) -> Option<u64> {
+    chars
+        .iter()
+        .try_fold(0, |acc, &c| Some(acc << 6 | sextet(c)?))
+}
+
+/// Go's `decodeQuantum`: up to four characters from `src[si..]` (line breaks skipped, and
+/// the padding), written into `dst`. Returns where it stopped and how many bytes it wrote.
+fn quantum(dst: &mut [u8], src: &[u8], mut si: usize) -> Option<(usize, usize)> {
+    let mut dbuf = [0u64; 4];
+    let mut dlen = 4;
+    let mut j = 0;
+    while j < 4 {
+        if si == src.len() {
+            // A missing `=` is an error for an encoding with padding.
+            return (j == 0).then_some((si, 0));
+        }
+        let c = src[si];
+        si += 1;
+        if let Some(v) = sextet(c) {
+            dbuf[j] = v;
+            j += 1;
+            continue;
+        }
+        if c == b'\n' || c == b'\r' {
+            continue;
+        }
+        if c != b'=' || j < 2 {
+            return None;
+        }
+        let skip = |si: &mut usize| {
+            while *si < src.len() && matches!(src[*si], b'\n' | b'\r') {
+                *si += 1;
+            }
+        };
+        if j == 2 {
+            skip(&mut si);
+            if src.get(si) != Some(&b'=') {
+                return None;
+            }
+            si += 1;
+        }
+        skip(&mut si);
+        if si < src.len() {
+            return None;
+        }
+        dlen = j;
+        break;
+    }
+    let v = dbuf[0] << 18 | dbuf[1] << 12 | dbuf[2] << 6 | dbuf[3];
+    let bytes = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let wrote = dlen - 1;
+    dst.get_mut(..wrote)?.copy_from_slice(&bytes[..wrote]);
+    Some((si, wrote))
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -268,6 +445,32 @@ mod tests {
             }
         }
         assert!(newly_taken >= 14, "{newly_taken}");
+    }
+
+    /// Go's decoder, written out for a repeated field, decodes what `decode_std` decodes and
+    /// refuses what it refuses, for texts made of base64, padding and line breaks.
+    #[test]
+    fn decoding_into_old_bytes_decodes_as_go_does() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = b"ABCDQUJx+/09==\n\r!";
+        for _ in 0..20_000 {
+            let len = next(40) as usize;
+            let text: Vec<u8> = (0..len)
+                .map(|_| alphabet[next(alphabet.len() as u64) as usize])
+                .collect();
+            let text = String::from_utf8(text).unwrap();
+            let mut buffer = vec![0xaa; next(50) as usize];
+            let got =
+                super::go_decode_into(&mut buffer, text.as_bytes()).map(|n| buffer[..n].to_vec());
+            let want = crate::wire::go_base64::decode_std(&text).ok();
+            assert_eq!(got, want, "{text:?}");
+        }
     }
 
     /// 64 bytes 0x00..0x3f, the size of a signature, written several ways. Go reads the

@@ -6,6 +6,7 @@ pub mod go_base64;
 pub mod go_bytes;
 pub mod go_json;
 pub mod go_object;
+pub mod go_raw;
 pub mod go_text;
 pub mod go_time;
 pub mod signal;

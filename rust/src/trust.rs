@@ -385,6 +385,8 @@ impl Serialize for Ovlast {
     }
 }
 
+impl crate::wire::go_text::GoRead for Ovlast {}
+
 impl<'de> Deserialize<'de> for Ovlast {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // The trait's reader (Go's rules), not the derive's own `OvlastWire::deserialize`.
@@ -550,6 +552,8 @@ impl Serialize for Membership {
         <MembershipWire as Serialize>::serialize(&MembershipWire::from(self), s)
     }
 }
+
+impl crate::wire::go_text::GoRead for Membership {}
 
 impl<'de> Deserialize<'de> for Membership {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -793,6 +797,8 @@ impl Serialize for Revocation {
         <RevocationWire as Serialize>::serialize(&RevocationWire::from(self), s)
     }
 }
+
+impl crate::wire::go_text::GoRead for Revocation {}
 
 impl<'de> Deserialize<'de> for Revocation {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

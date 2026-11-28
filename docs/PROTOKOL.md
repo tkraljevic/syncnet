@@ -597,6 +597,7 @@ skraćena, ali samo dok se stanje pomiče.
 | `vrste` | mapa tekst → cijeli broj | vrsta zapisa → najviša shema koju pošiljatelj razumije |
 | `cekaNadogradnju` | cijeli broj | koliko zapisa kod pošiljatelja čeka noviju aplikaciju |
 | `uloge` | popis teksta | oznake koje aplikacija javlja o računalu; samo za prikaz |
+| `karta` | `{otisak, slozena, dijelova, svih}` | što aplikacija javlja o karti koju računalo drži bez mreže; samo za prikaz |
 
 Sva polja osim `frontier` izostaju kad su prazna. Tipovi polja
 `mogucnosti`, `vrste` i `cekaNadogradnju` ne smiju se nikad promijeniti:
@@ -1169,6 +1170,10 @@ gdje se to vidi na žici. Rješavaju se prije objave:
   daje aplikacija.
 - Pravila u `wants.rules` imaju oblik koji razumije samo ta aplikacija, a
   tumači ih pošiljatelj. U syncnetu pravilo daje aplikacija.
+- Rust čita `wants.rules` i `karta` u obliku te aplikacije, da odbije istu
+  granicu koju ona odbija. Pravilo druge aplikacije u kojem isto ime polja
+  ima drugi tip (npr. tekst umjesto broja) zato se odbija.
+  U syncnetu provjeru oblika treba dati aplikacija.
 - `uloge` u granici danas imaju dvije stalne vrijednosti.
 - Vrsta zapisa koja nosi članstva stalna je u kodu. U syncnetu je daje
   aplikacija.
