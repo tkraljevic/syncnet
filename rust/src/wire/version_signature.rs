@@ -23,6 +23,14 @@
 //! them passes only when the signature holds under that key: a wrong signature, or only
 //! one of the two fields, never does. Both fields are read as Go reads base64
 //! (`wire::go_base64`), so the two sides take and refuse the same texts.
+//!
+//! `kljuc_autora` goes into the signed bytes as it is written, so a key written in a
+//! non-canonical way (a line break, spare bits set) can still carry a valid signature over
+//! that very text. Go binds the key to the name by comparing this text, character for
+//! character, with `deviceKey` of a membership, and a membership is valid only with the
+//! canonical text. In Go such a version is therefore neither wrong nor taken in: it waits
+//! for good. A receiver that binds by the decoded key bytes instead would take in what Go
+//! never does, so it has to compare the text as written.
 
 use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::wire::conversation_v1::VersionV1;
