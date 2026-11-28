@@ -25,7 +25,7 @@
 //!   later array is long enough. `null` or `[]` in place of the array starts again.
 //!   The slice is as long as the last array.
 //!
-//! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and [`go_struct!`]
+//! The struct keeps its serde derive under `#[serde(remote = "Self")]`, and `go_struct!`
 //! puts this reader in front of it: keys are mapped to field names, repeats are settled,
 //! and the derive reads the result.
 
@@ -255,7 +255,7 @@ impl Drop for Checking {
 }
 
 /// Whether the value being read is a repeat that Go reads and then overwrites (see
-/// [`check`]). A field's own rule on the value a record keeps, beyond what Go asks of the
+/// `check`). A field's own rule on the value a record keeps, beyond what Go asks of the
 /// type, applies only when this is false.
 pub fn checking_repeat() -> bool {
     CHECKING.with(|c| c.get() > 0)

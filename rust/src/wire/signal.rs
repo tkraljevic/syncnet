@@ -119,16 +119,6 @@ fn is_none_or_zero(v: &Option<i64>) -> bool {
     v.is_none_or(|n| n == 0)
 }
 
-/// Go reads a missing `ver` and a `null` one as 0 (`null` leaves a Go `int` as it is), so
-/// such a body is turned away by the shape check after the signature, as in Go, and not
-/// already when it is read.
-fn go_int_or_zero<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
-}
-
 /// Field names are read as Go reads them (see [`crate::wire::go_object`]): in any ASCII
 /// case, and a field given twice counts the last time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,7 +127,12 @@ pub struct SignalBody {
     /// Numbers are Go `int`, 64 bits on 64-bit platforms (a 32-bit Go build would already
     /// refuse values past 2^31 when it reads them): Go reads any of them, negative ones
     /// too, and only the checks after the signature say which it takes.
-    #[serde(default, deserialize_with = "go_int_or_zero")]
+    ///
+    /// Go reads a missing `ver` and a `null` one as 0 (`null` leaves a Go `int` as it is),
+    /// so such a body is turned away by the shape check after the signature, as in Go, and
+    /// not already when it is read. A `null` never reaches the derive: the Go reader
+    /// ([`crate::wire::go_object`]) leaves it out, and a missing `ver` is 0.
+    #[serde(default)]
     pub ver: i64,
     pub sesija: String,
     /// The sender's key as the message carries it. Several texts read to the same key
