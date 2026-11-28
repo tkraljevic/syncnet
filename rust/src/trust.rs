@@ -806,77 +806,11 @@ pub mod rfc3339_unix {
         format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
     }
 
+    /// Unix seconds (rounded down) of a time as Go reads one ([`go_time::parse`]).
     pub fn parse_utc(s: &str) -> Result<i64, String> {
-        const DIGITS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
-        let b = s.as_bytes();
-        // Untrusted input: all-ASCII keeps every byte slice below on a char boundary,
-        // and explicit digit checks stop `str::parse` from accepting signs like "+1".
-        if !s.is_ascii()
-            || b.len() < 20
-            || DIGITS.iter().any(|&i| !b[i].is_ascii_digit())
-            || b[4] != b'-'
-            || b[7] != b'-'
-            || (b[10] != b'T' && b[10] != b't')
-            || b[13] != b':'
-            || b[16] != b':'
-        {
-            return Err("invalid RFC 3339 timestamp".into());
-        }
-        let year: i64 = s[0..4].parse().map_err(|_| "invalid year")?;
-        let month: u32 = s[5..7].parse().map_err(|_| "invalid month")?;
-        let day: u32 = s[8..10].parse().map_err(|_| "invalid day")?;
-        let hour: i64 = s[11..13].parse().map_err(|_| "invalid hour")?;
-        let min: i64 = s[14..16].parse().map_err(|_| "invalid minute")?;
-        let sec: i64 = s[17..19].parse().map_err(|_| "invalid second")?;
-        if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
-            || hour > 23
-            || min > 59
-            || sec > 60
-        {
-            return Err("timestamp component out of range".into());
-        }
-
-        let mut rest = &s[19..];
-        if let Some(after_dot) = rest.strip_prefix('.') {
-            let digits = after_dot.bytes().take_while(|c| c.is_ascii_digit()).count();
-            if digits == 0 {
-                return Err("empty fractional seconds".into());
-            }
-            rest = &after_dot[digits..];
-        }
-
-        let offset_secs: i64 = if rest == "Z" || rest == "z" {
-            0
-        } else if (rest.starts_with('+') || rest.starts_with('-')) && rest.len() == 6 {
-            let sign = if rest.starts_with('+') { 1 } else { -1 };
-            let ob = rest.as_bytes();
-            if ob[3] != b':' || ![1, 2, 4, 5].iter().all(|&i| ob[i].is_ascii_digit()) {
-                return Err("invalid timezone offset".into());
-            }
-            let oh: i64 = rest[1..3].parse().map_err(|_| "invalid offset hour")?;
-            let om: i64 = rest[4..6].parse().map_err(|_| "invalid offset minute")?;
-            if oh > 23 || om > 59 {
-                return Err("timezone offset out of range".into());
-            }
-            sign * (oh * 3600 + om * 60)
-        } else {
-            return Err("missing or invalid timezone".into());
-        };
-
-        let days = days_from_civil(year, month, day);
-        Ok(days * 86_400 + hour * 3600 + min * 60 + sec - offset_secs)
-    }
-
-    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-        let y = y - if m <= 2 { 1 } else { 0 };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = (y - era * 400) as u64;
-        let m = m as u64;
-        let d = d as u64;
-        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146_097 + (doe as i64) - 719_468
+        go_time::parse(s.as_bytes())
+            .map(|t| t.unix)
+            .ok_or_else(|| format!("invalid RFC 3339 timestamp {s:?}"))
     }
 
     pub fn serialize<S: Serializer>(unix: &i64, ser: S) -> Result<S::Ok, S::Error> {
