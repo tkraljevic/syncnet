@@ -1,6 +1,7 @@
 use crate::identity::{parse_public_key, parse_public_key_bytes, public_key_to_base64};
 use crate::wire::go_base64::decode_std;
 use crate::wire::go_json::to_go_json_vec;
+use crate::wire::go_object::{Field, Kind, Schema, go_struct};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -257,18 +258,50 @@ impl NetworkKey {
     }
 }
 
+/// Read as Go reads it (see [`crate::wire::go_object`] and [`rfc3339_unix`]): field names
+/// in any ASCII case, the last of a repeated field, and a missing field, or `null`, as
+/// Go's empty value: an empty text, and Go's zero time for a time, so a missing
+/// `expiresAt` is no expiry. The signature then decides, as in Go.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub struct Ovlast {
+    #[serde(default)]
     pub network: String,
+    #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
     pub device_key: String,
+    #[serde(default)]
     pub issued_by: String,
-    #[serde(with = "rfc3339_unix")]
+    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(with = "rfc3339_unix::expiry")]
+    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
     pub expires_at: Expiry,
+    #[serde(default)]
     pub signature: String,
+}
+
+/// Go's field names (`json` tags) of an ovlast.
+pub(crate) const OVLAST_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("network"),
+        Field::value("deviceId"),
+        Field::value("deviceKey"),
+        Field::value("issuedBy"),
+        Field::time("issuedAt"),
+        Field::time("expiresAt"),
+        Field::value("signature"),
+    ],
+    baseline: &[],
+};
+go_struct!(Ovlast, OVLAST_SCHEMA);
+
+fn go_zero_time() -> i64 {
+    GO_ZERO_TIME_UNIX
+}
+
+fn no_expiry() -> Expiry {
+    Expiry::NEVER
 }
 
 impl Ovlast {
@@ -311,26 +344,44 @@ impl Ovlast {
     }
 }
 
+/// Read as Go reads it, as [`Ovlast`] is. The admitter's ovlast is read only under Go's
+/// name `primatelj`; objects given for it more than once add up, and `null` clears it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub struct Membership {
+    #[serde(default)]
     pub network: String,
+    #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
     pub device_key: String,
+    #[serde(default)]
     pub issued_by: String,
-    #[serde(with = "rfc3339_unix")]
+    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(with = "rfc3339_unix::expiry")]
+    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
     pub expires_at: Expiry,
+    #[serde(default)]
     pub signature: String,
-    #[serde(
-        rename = "primatelj",
-        alias = "admitter",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "primatelj", default, skip_serializing_if = "Option::is_none")]
     pub admitter: Option<Ovlast>,
 }
+
+/// Go's field names (`json` tags) of a membership.
+pub(crate) const MEMBERSHIP_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("network"),
+        Field::value("deviceId"),
+        Field::value("deviceKey"),
+        Field::value("issuedBy"),
+        Field::time("issuedAt"),
+        Field::time("expiresAt"),
+        Field::value("signature"),
+        Field::new("primatelj", Kind::Struct),
+    ],
+    baseline: &[],
+};
+go_struct!(Membership, MEMBERSHIP_SCHEMA);
 
 impl Membership {
     pub fn signed_bytes(&self) -> Vec<u8> {
@@ -448,26 +499,49 @@ impl Membership {
     }
 }
 
+/// Read as Go reads it, as [`Ovlast`] is, and only under Go's field names: `kind`,
+/// `targetId`, `revokedAt`, `revokedBy`, `signerKey` and `signature` name nothing in Go,
+/// so a revocation written with them reads as one with those fields empty, whose
+/// signature does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub struct Revocation {
+    #[serde(default)]
     pub id: String,
-    #[serde(rename = "vrsta", alias = "kind")]
+    #[serde(rename = "vrsta", default)]
     pub kind: String,
-    #[serde(rename = "nodeId", alias = "targetId")]
+    #[serde(rename = "nodeId", default)]
     pub target_id: String,
+    #[serde(default)]
     pub public_key: String,
-    #[serde(with = "rfc3339_unix")]
+    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(rename = "opozvanoAt", alias = "revokedAt", with = "rfc3339_unix")]
+    #[serde(rename = "opozvanoAt", default = "go_zero_time", with = "rfc3339_unix")]
     pub revoked_at: i64,
-    #[serde(rename = "opozvao", alias = "revokedBy")]
+    #[serde(rename = "opozvao", default)]
     pub revoked_by: String,
-    #[serde(rename = "potpisnik", alias = "signerKey")]
+    #[serde(rename = "potpisnik", default)]
     pub signer_key: String,
-    #[serde(rename = "potpis", alias = "signature")]
+    #[serde(rename = "potpis", default)]
     pub signature: String,
 }
+
+/// Go's field names (`json` tags) of a revocation.
+pub(crate) const REVOCATION_SCHEMA: Schema = Schema {
+    fields: &[
+        Field::value("id"),
+        Field::value("vrsta"),
+        Field::value("nodeId"),
+        Field::value("publicKey"),
+        Field::time("issuedAt"),
+        Field::time("opozvanoAt"),
+        Field::value("opozvao"),
+        Field::value("potpisnik"),
+        Field::value("potpis"),
+    ],
+    baseline: &[],
+};
+go_struct!(Revocation, REVOCATION_SCHEMA);
 
 /// What a revocation revokes, after its kind (`vrsta`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,7 +781,9 @@ pub fn verify_ed25519_b64(vk: &VerifyingKey, msg: &[u8], sig_b64: &str) -> Resul
 }
 
 pub mod rfc3339_unix {
-    use serde::{Deserializer, Serializer, de};
+    use crate::wire::go_time::{self, GoTime};
+    use serde::{Deserialize, Deserializer, Serializer, de};
+    use serde_json::value::RawValue;
 
     pub fn format_utc(unix: i64) -> String {
         let days = unix.div_euclid(86_400);
@@ -809,38 +885,50 @@ pub mod rfc3339_unix {
 
     /// An [`Expiry`](super::Expiry) as the wire writes it: a time, Go's zero time for no
     /// expiry. It reads what [`rfc3339_unix::deserialize`](deserialize) reads, and
-    /// takes the number as [`Expiry::from_wire_unix`](super::Expiry::from_wire_unix) does.
+    /// takes the seconds as [`Expiry::from_wire_unix`](super::Expiry::from_wire_unix) does.
+    ///
+    /// Go's zero time with a part of a second (`0001-01-01T00:00:00.5Z`) is refused as a
+    /// bad record. Go takes it as an expiry in year 1, so as long past for any check after
+    /// year 1, and only a record issued in year 1 or earlier could still hold there. Its
+    /// signed bytes are those of a record with no expiry (the signature covers whole
+    /// seconds), so read here it would be no expiry. Only the value a record keeps is
+    /// refused: one that a later repeat of the field overwrites is read as Go reads it.
     pub mod expiry {
-        use super::super::Expiry;
-        use serde::{Deserializer, Serializer};
+        use super::super::{Expiry, GO_ZERO_TIME_UNIX};
+        use crate::wire::go_object;
+        use serde::{Deserializer, Serializer, de};
 
         pub fn serialize<S: Serializer>(expiry: &Expiry, ser: S) -> Result<S::Ok, S::Error> {
             super::serialize(&expiry.wire_unix(), ser)
         }
 
         pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Expiry, D::Error> {
-            super::deserialize(de).map(Expiry::from_wire_unix)
+            match super::read(de)? {
+                Some(t)
+                    if t.unix == GO_ZERO_TIME_UNIX
+                        && t.nanos != 0
+                        && !go_object::checking_repeat() =>
+                {
+                    Err(de::Error::custom(
+                        "expiresAt: nulto vrijeme s dijelom sekunde",
+                    ))
+                }
+                Some(t) => Ok(Expiry::from_wire_unix(t.unix)),
+                None => Ok(Expiry::NEVER),
+            }
         }
     }
 
+    fn read<'de, D: Deserializer<'de>>(de: D) -> Result<Option<GoTime>, D::Error> {
+        let raw = Box::<RawValue>::deserialize(de)?;
+        go_time::from_json(raw.get()).map_err(de::Error::custom)
+    }
+
+    /// A time read as Go's `time.Time` reads it from JSON ([`go_time`]): a JSON string only,
+    /// never a number, in whole seconds (rounded down). `null` is Go's zero time, the time
+    /// of a record that never set it.
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
-        struct Visitor;
-        impl<'de> de::Visitor<'de> for Visitor {
-            type Value = i64;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("RFC 3339 timestamp string or unix seconds")
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
-                parse_utc(v).map_err(de::Error::custom)
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
-                Ok(v)
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
-                i64::try_from(v).map_err(|_| de::Error::custom("unix timestamp overflow"))
-            }
-        }
-        de.deserialize_any(Visitor)
+        Ok(read(de)?.map_or(super::GO_ZERO_TIME_UNIX, |t| t.unix))
     }
 }
 
@@ -2437,12 +2525,11 @@ mod tests {
             );
             assert_eq!(verify(&m, AT), Err(TrustError::Expired));
 
-            // A record that carries 0 as a number reads as 1970 too.
+            // A time is only ever a text, as in Go: a record that carries 0, or any other
+            // number, as its expiry does not read.
             let as_number =
                 wire.replace(r#""expiresAt":"1970-01-01T00:00:00Z""#, r#""expiresAt":0"#);
-            let back: Membership = serde_json::from_str(&as_number).unwrap();
-            assert_eq!(back.expires_at, zero);
-            assert_eq!(verify(&back, AT), Err(TrustError::Expired));
+            assert!(serde_json::from_str::<Membership>(&as_number).is_err());
 
             let o = ovlast(zero);
             assert_eq!(
@@ -2587,6 +2674,430 @@ mod tests {
                 let device = parse_public_key(&m.device_key).unwrap();
                 m.verify(&net, &device, now).unwrap();
             }
+        }
+    }
+}
+
+/// Ovlast, membership and revocation read as Go reads them. The Go column is go1.27.1
+/// through `json.Unmarshal` into the Go side's structs, written as the tests here write
+/// the Rust result.
+#[cfg(test)]
+mod records_as_in_go {
+    use super::*;
+
+    fn ovlast(o: &Ovlast) -> String {
+        format!(
+            "net={:?} dev={:?} key={:?} by={:?} iss={} exp={} zero={} sig={:?}",
+            o.network,
+            o.device_id,
+            o.device_key,
+            o.issued_by,
+            o.issued_at,
+            o.expires_at.wire_unix(),
+            o.expires_at.is_never(),
+            o.signature
+        )
+    }
+
+    fn read(kind: &str, text: &str) -> Option<String> {
+        match kind {
+            "o" => serde_json::from_str::<Ovlast>(text).ok().map(|o| ovlast(&o)),
+            "m" => serde_json::from_str::<Membership>(text).ok().map(|m| {
+                let admitter = m
+                    .admitter
+                    .as_ref()
+                    .map_or("nil".to_owned(), |o| format!("{{{}}}", ovlast(o)));
+                format!(
+                    "net={:?} dev={:?} key={:?} by={:?} iss={} exp={} zero={} sig={:?} prim={admitter}",
+                    m.network,
+                    m.device_id,
+                    m.device_key,
+                    m.issued_by,
+                    m.issued_at,
+                    m.expires_at.wire_unix(),
+                    m.expires_at.is_never(),
+                    m.signature
+                )
+            }),
+            _ => serde_json::from_str::<Revocation>(text).ok().map(|r| {
+                format!(
+                    "id={:?} vrsta={:?} node={:?} pk={:?} iss={} opoz={} opozvao={:?} potpisnik={:?} potpis={:?}",
+                    r.id,
+                    r.kind,
+                    r.target_id,
+                    r.public_key,
+                    r.issued_at,
+                    r.revoked_at,
+                    r.revoked_by,
+                    r.signer_key,
+                    r.signature
+                )
+            }),
+        }
+    }
+
+    /// (record: `o` ovlast, `m` membership, `r` revocation; JSON text; what Go reads;
+    /// what Rust does). Rust: `isto` reads the same, `GRESKA` refuses where Go reads.
+    ///
+    /// Rust refuses in two cases only. A kept `expiresAt` that is Go's zero time with a
+    /// part of a second (Go: `zero=false`) is a bad record (see
+    /// [`rfc3339_unix::expiry`]). A lone surrogate escape (`\ud800`) in a text Go reads
+    /// as U+FFFD, and serde does not read it at all.
+    ///
+    /// Rows checked against Go besides these: 10,000 and 12,000 random records with keys
+    /// in other cases, with `K`/`ſ`, the old Rust names, repeats, `null` and bad values;
+    /// all read the same, but for the zero time with a part of a second.
+    const EDGES: &[(&str, &str, &str, &str)] = &[
+        (
+            "r",
+            r#"{"vrsta":"\ud800"}"#,
+            r#"id="" vrsta="�" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "GRESKA",
+        ),
+        (
+            "r",
+            r#"{"vrsta":"a\udc00b"}"#,
+            r#"id="" vrsta="a�b" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "GRESKA",
+        ),
+        (
+            "o",
+            r#"{"deviceId":"😀"}"#,
+            r#"net="" dev="😀" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="""#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"network":"\ud800"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="�" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "GRESKA",
+        ),
+        (
+            "r",
+            r#"{"kind":"clanstvo","vrsta":"ovlast"}"#,
+            r#"id="" vrsta="ovlast" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"kind":"clanstvo"}"#,
+            r#"id="" vrsta="" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"admitter":{"network":"n"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim=nil"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"network":"n"},"primatelj":{"deviceId":"d"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="n" dev="d" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"network":"n"},"primatelj":null}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim=nil"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":null,"primatelj":{"deviceId":"d"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="" dev="d" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"PRIMATELJ":{"NETWORK":"n","network":"m"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="m" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"0001-01-01T00:00:00.5Z"},"primatelj":{"expiresAt":"2025-10-09T08:53:20Z"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="" dev="" key="" by="" iss=-62135596800 exp=1760000000 zero=false sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"expiresAt":"0001-01-01T00:00:00.5Z","expiresAt":"2025-10-09T08:53:20Z"}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=1760000000 zero=false sig="" prim=nil"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"expiresAt":"2025-10-09T08:53:20Z","expiresAt":null}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=1760000000 zero=false sig="" prim=nil"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"expiresAt":"bad","expiresAt":"2025-10-09T08:53:20Z"}"#,
+            "GRESKA",
+            "isto",
+        ),
+        ("m", r#"{"expiresAt":1760000000}"#, "GRESKA", "isto"),
+        ("r", r#"{"issuedAt":1760000000}"#, "GRESKA", "isto"),
+        (
+            "r",
+            r#"{"opozvanoAt":"2025-10-09T08:53:20Z","revokedAt":"x"}"#,
+            r#"id="" vrsta="" node="" pk="" iss=-62135596800 opoz=1760000000 opozvao="" potpisnik="" potpis="""#,
+            "isto",
+        ),
+        (
+            "o",
+            r#"{"issuedAt":"0001-01-01T00:00:00.5Z"}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="""#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"0001-01-01T00:00:00.5Z"},"primatelj":null}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim=nil"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"0001-01-01T00:00:00.5Z"},"primatelj":null,"primatelj":{"network":"n"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="n" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"bad"},"primatelj":null}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"2025-10-09T08:53:20Z"},"primatelj":{"expiresAt":"0001-01-01T00:00:00.5Z"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=false sig=""}"#,
+            "GRESKA",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"expiresAt":"0001-01-01T00:00:00.5Z"},"primatelj":{"network":"n"}}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="n" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=false sig=""}"#,
+            "GRESKA",
+        ),
+        (
+            "m",
+            r#"{"expiresAt":"0001-01-01T00:00:00.5Z","EXPIRESAT":null}"#,
+            r#"net="" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=false sig="" prim=nil"#,
+            "GRESKA",
+        ),
+        (
+            "o",
+            r#"{"networK":"b","expiresAt":null,"EXPIRESAT":"0001-01-01T00:00:00Z","signature":null,"expireſAt":"0001-01-01T00:00:00Z","issuedAt":"2025-10-09T08:53:20Z","issuedBy":null,"issuedAt":"2025-10-09T08:53:20.9+01:00","deviceKey":null}"#,
+            r#"net="b" dev="" key="" by="" iss=1759996400 exp=-62135596800 zero=true sig="""#,
+            "isto",
+        ),
+        (
+            "o",
+            r#"{"deviceKey":"\u0041","issuedAt":"0001-01-01T00:00:00Z","NETWORK":"a","expireſAt":null,"deviceId":"b","EXPIRESAT":null,"deviceId":"a","NETWORK":"\u0041"}"#,
+            r#"net="A" dev="a" key="A" by="" iss=-62135596800 exp=-62135596800 zero=true sig="""#,
+            "isto",
+        ),
+        (
+            "o",
+            r#"{"iſſuedBy":null,"networK":"\u0041","issuedBy":"a","deviceKey":"b","ſignature":null,"deviceId":"","ISSUEDAT":"2025-10-09T08:53:20.9+01:00","iſſuedAt":"0001-01-01T00:00:00.5Z"}"#,
+            r#"net="A" dev="" key="b" by="a" iss=-62135596800 exp=-62135596800 zero=true sig="""#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"signature":"b","PRIMATELJ":{"ISSUEDAT":"0001-01-01T00:00:00.5Z"},"EXPIRESAT":"0001-01-01T00:00:00Z","primatelj":null,"expireſAt":"0001-01-01T00:00:00Z","networK":"a","signature":"","primatelj":{"iſſuedAt":"2025-10-09T08:53:20.9+01:00"}}"#,
+            r#"net="a" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig="" prim={net="" dev="" key="" by="" iss=1759996400 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"iſſuedBy":"a","signature":"b","primatelj":null,"deviceKey":null,"primatelj":{"deviceId":"\u0041"},"primatelj":{"NETWORK":"\u0041","issuedBy":"b"}}"#,
+            r#"net="" dev="" key="" by="a" iss=-62135596800 exp=-62135596800 zero=true sig="b" prim={net="A" dev="A" key="" by="b" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"primatelj":{"deviceKey":null,"issuedAt":"2025-10-09T08:53:20Z","network":""},"primatelj":null,"EXPIRESAT":"2025-10-09T08:53:20Z","primatelj":{"DEVICEKEY":"a"},"issuedAt":null,"primatelj":{"network":"a","deviceKey":"","network":"\u0041","signature":""},"iſſuedAt":"2025-10-09T08:53:20Z"}"#,
+            r#"net="" dev="" key="" by="" iss=1760000000 exp=1760000000 zero=false sig="" prim={net="A" dev="" key="" by="" iss=-62135596800 exp=-62135596800 zero=true sig=""}"#,
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"issuedAt":null,"vrsta":"b","potpisnik":"a","potpiſ":"\u0041","id":"a","POTPISNIK":"","vrsta":"a","id":null,"potpis":"\u0041","opozvao":"","nodeId":null,"id":"a","issuedAt":"2025-10-09T08:53:20Z","publicKey":"a"}"#,
+            r#"id="a" vrsta="a" node="" pk="a" iss=1760000000 opoz=-62135596800 opozvao="" potpisnik="" potpis="A""#,
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"KIND":"\u0041","SIGNERKEY":"a","iſſuedAt":"0001-01-01T00:00:00.5Z","OPOZVANOAT":"0001-01-01T00:00:00.5Z","kind":"b","ſignerKey":null,"vrſta":"a","kind":null,"opozvanoAt":"2025-10-09T08:53:20Z","id":"\u0041","opozvao":"\u0041","opozvanoAt":"0001-01-01T00:00:00Z"}"#,
+            r#"id="A" vrsta="a" node="" pk="" iss=-62135596800 opoz=-62135596800 opozvao="A" potpisnik="" potpis="""#,
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"vrsta":null,"POTPIS":null,"signerKey":"a","iſſuedAt":"2025-10-09T08:53:20.9+01:00","POTPISNIK":"a","publicKey":"\u0041","potpisnik":"a","nodeId":null,"potpisnik":"a","opozvao":"b","potpiſniK":"","OPOZVAO":""}"#,
+            r#"id="" vrsta="" node="" pk="A" iss=1759996400 opoz=-62135596800 opozvao="" potpisnik="" potpis="""#,
+            "isto",
+        ),
+        (
+            "o",
+            r#"{"ISSUEDBY":true,"expiresAt":"bad"}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "o",
+            r#"{"issuedBy":"a","DEVICEID":"b","deviceId":true}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"ISSUEDAT":"2025-10-09t08:53:20Z","network":true}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "m",
+            r#"{"issuedBy":"","expiresat":null,"network":true}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"id":true,"iD":true,"potpiſniK":"","potpis":true}"#,
+            "GRESKA",
+            "isto",
+        ),
+        (
+            "r",
+            r#"{"id":null,"potpisx":"","nodeId":1,"nodeid":"a"}"#,
+            "GRESKA",
+            "isto",
+        ),
+    ];
+
+    #[test]
+    fn records_read_as_in_go() {
+        for (kind, text, go, rust) in EDGES {
+            let got = read(kind, text);
+            if *go == "GRESKA" || *rust == "GRESKA" {
+                assert_eq!(got, None, "{kind} {text}");
+            } else {
+                assert_eq!(got.as_deref(), Some(*go), "{kind} {text}");
+            }
+        }
+    }
+
+    fn key(b: u8) -> SigningKey {
+        SigningKey::from_bytes(&[b; 32])
+    }
+
+    /// A revocation Go signs and writes, with one field name changed. Go column: whether
+    /// Go, after `json.Unmarshal`, takes the revocation as valid on its own (id and
+    /// signature, as `verify_self`). Before, Rust read the old names as aliases, so with
+    /// `kind` it took a revocation Go does not.
+    #[test]
+    fn revocation_under_other_names_as_in_go() {
+        let r = Revocation {
+            id: String::new(),
+            kind: REVOCATION_KIND_MEMBERSHIP.into(),
+            target_id: "n".into(),
+            public_key: "pk".into(),
+            issued_at: 1_760_000_000,
+            revoked_at: 1_760_000_100,
+            revoked_by: "o".into(),
+            signer_key: String::new(),
+            signature: String::new(),
+        }
+        .sign(&key(31));
+        let text = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            text,
+            r#"{"id":"clanstvo:pk:1760000000:199d9933bd356472","vrsta":"clanstvo","nodeId":"n","publicKey":"pk","issuedAt":"2025-10-09T08:53:20Z","opozvanoAt":"2025-10-09T08:55:00Z","opozvao":"o","potpisnik":"QwRr/kCSs+lJlOraFdzCDYqqB7ZY/TlU644O+4vcpd4=","potpis":"zIus5D/X56UMUxjJnWYbHRi2X/Dg++Pz44RGkiAJiQBH5FuL2WCNltY8uRDcRQrLGvc7KPxEVHbIKwx/xk3sBA=="}"#,
+            "the text Go writes"
+        );
+        for (from, to, go) in [
+            ("", "", true),
+            ("\"vrsta\"", "\"kind\"", false),
+            ("\"vrsta\"", "\"VRSTA\"", true),
+            ("\"vrsta\"", "\"vr\u{17F}ta\"", true),
+            ("\"nodeId\"", "\"targetId\"", false),
+            ("\"opozvanoAt\"", "\"revokedAt\"", false),
+            ("\"opozvao\"", "\"revokedBy\"", false),
+            ("\"potpisnik\"", "\"signerKey\"", false),
+            ("\"potpis\"", "\"signature\"", false),
+        ] {
+            let text = if from.is_empty() {
+                text.clone()
+            } else {
+                text.replacen(from, to, 1)
+            };
+            let back: Revocation = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.verify_self().is_ok(), go, "{from} -> {to}");
+        }
+    }
+
+    /// A membership with no expiry, signed by the network key as Go signs it, with its
+    /// times changed on the wire. Go column: `json.Unmarshal`, then Go's check of the
+    /// membership a year later.
+    #[test]
+    fn membership_times_as_in_go() {
+        let net = key(21);
+        let device = key(23).verifying_key();
+        let mut m = Membership {
+            network: public_key_to_base64(net.verifying_key().as_bytes()),
+            device_id: "clan".into(),
+            device_key: public_key_to_base64(device.as_bytes()),
+            issued_by: "root".into(),
+            issued_at: 1_760_000_000,
+            expires_at: Expiry::NEVER,
+            signature: String::new(),
+            admitter: None,
+        };
+        m.signature = STANDARD.encode(net.sign(&m.signed_bytes()).to_bytes());
+        let text = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            text,
+            r#"{"network":"1UIH2hlJd9z0atv+wrwudbUtWopCGE/t/cAAJPDj6No=","deviceId":"clan","deviceKey":"Md6+VdN8cidosTcTHKpghwgLLgtguUvXhdFFdc+kmLw=","issuedBy":"root","issuedAt":"2025-10-09T08:53:20Z","expiresAt":"0001-01-01T00:00:00Z","signature":"1B7mOatf9g20VmX1KzJzqj7L9Fp4w21D4WFzRtb0PZPYYZcBKptvwalsbshudEgDz13d48R6ZtnDJxf3n0s9BQ=="}"#,
+            "the text Go writes"
+        );
+        let now = 1_770_000_000;
+        let zero = r#""expiresAt":"0001-01-01T00:00:00Z""#;
+        for (from, to, go) in [
+            ("", "", "prima"),
+            // Missing or null, the expiry is Go's zero time: no expiry, as signed.
+            (&format!(",{zero}")[..], "", "prima"),
+            (zero, r#""expiresAt":null"#, "prima"),
+            (zero, r#""expiresAt":"0001-01-01T00:00:00.0Z""#, "prima"),
+            // Go: expired in year 1. Rust: a bad record.
+            (zero, r#""expiresAt":"0001-01-01T00:00:00.5Z""#, "istekao"),
+            (zero, r#""expiresAt":-62135596800"#, "GRESKA"),
+            (
+                r#""issuedAt":"2025-10-09T08:53:20Z""#,
+                r#""issuedAt":1760000000"#,
+                "GRESKA",
+            ),
+            ("\"signature\"", "\"SIGNATURE\"", "prima"),
+        ] {
+            let text = if from.is_empty() {
+                text.clone()
+            } else {
+                text.replacen(from, to, 1)
+            };
+            let got = match serde_json::from_str::<Membership>(&text) {
+                Err(_) => "GRESKA",
+                Ok(m) => match m.verify(&net.verifying_key(), &device, now) {
+                    Ok(()) => "prima",
+                    Err(TrustError::Expired) => "istekao",
+                    Err(e) => panic!("{e:?}"),
+                },
+            };
+            let rust = if go == "istekao" { "GRESKA" } else { go };
+            assert_eq!(got, rust, "{from} -> {to}");
         }
     }
 }

@@ -29,8 +29,10 @@
 //! puts this reader in front of it: keys are mapped to field names, repeats are settled,
 //! and the derive reads the result.
 
+use crate::wire::go_time;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
+use std::cell::Cell;
 use std::fmt;
 
 /// How a field takes a repeat and `null`, after its Go type.
@@ -45,6 +47,10 @@ pub enum Kind {
     /// A slice of structs: arrays are read into the same elements, `null` and `[]` clear
     /// it.
     StructSlice,
+    /// A `time.Time`: `null` leaves it as it was, and each repeat must read as a time
+    /// ([`crate::wire::go_time`]). A rule the struct sets on the value it keeps (as on a
+    /// record's `expiresAt`) holds only for the last one.
+    Time,
 }
 
 /// A field as Go names it, with its kind.
@@ -65,6 +71,10 @@ impl Field {
 
     pub const fn nullable(name: &'static str) -> Self {
         Self::new(name, Kind::Nullable)
+    }
+
+    pub const fn time(name: &'static str) -> Self {
+        Self::new(name, Kind::Time)
     }
 }
 
@@ -169,11 +179,15 @@ fn settle<T>(
         if values.len() > 1 {
             // Go reads every one of them, so a bad one fails the whole object.
             for v in values.iter().filter(|v| !is_null(v)) {
-                check(schema, field.name, v.get(), finish)?;
+                if field.kind == Kind::Time {
+                    go_time::from_json(v.get())?;
+                } else {
+                    check(schema, field.name, v.get(), finish)?;
+                }
             }
         }
         let last = match field.kind {
-            Kind::Value => values
+            Kind::Value | Kind::Time => values
                 .iter()
                 .rev()
                 .find(|v| !is_null(v))
@@ -205,15 +219,46 @@ fn baseline_with(schema: &Schema, field: Option<(&str, &str)>) -> String {
 }
 
 /// Reads one value of a repeated field in the smallest object the struct takes.
+///
+/// While it runs, [`checking_repeat`] is true, also for every struct read inside it: the
+/// value is one Go reads and then overwrites, so a rule a struct sets on the value it
+/// keeps does not hold for it.
 fn check<T>(
     schema: &Schema,
     name: &str,
     raw: &str,
     finish: fn(&str) -> serde_json::Result<T>,
 ) -> Result<(), String> {
+    let _checking = Checking::enter();
     finish(&baseline_with(schema, Some((name, raw))))
         .map(drop)
         .map_err(|e| e.to_string())
+}
+
+thread_local! {
+    static CHECKING: Cell<u32> = const { Cell::new(0) };
+}
+
+struct Checking;
+
+impl Checking {
+    fn enter() -> Self {
+        CHECKING.with(|c| c.set(c.get() + 1));
+        Self
+    }
+}
+
+impl Drop for Checking {
+    fn drop(&mut self) {
+        CHECKING.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// Whether the value being read is a repeat that Go reads and then overwrites (see
+/// [`check`]). A field's own rule on the value a record keeps, beyond what Go asks of the
+/// type, applies only when this is false.
+pub fn checking_repeat() -> bool {
+    CHECKING.with(|c| c.get() > 0)
 }
 
 /// A pointer to a struct: the objects since the last `null` add up into one.
