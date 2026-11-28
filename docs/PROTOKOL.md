@@ -78,7 +78,16 @@ aplikacije uzima drugo ime, npr. s nastavkom `-sim`.
 - Ključ mreže je Ed25519. Privatni dio drže samo računala koja smiju
   primati članove. Javni dio drži svaki član.
 - Javni ključ se svuda piše kao standardni base64 s dopunom (44 znaka za 32
-  bajta).
+  bajta). To je kanonski tekst ključa: bez novih redova, a bitovi zadnjeg
+  znaka koji ne nose podatak su nule.
+- Potpis Ed25519 provjerava se svuda kao u standardnoj biblioteci Goa
+  (`crypto/ed25519`), bez kofaktora. Potpis čiji `s` nije manji od reda
+  grupe L je kriv. `R` iz potpisa uspoređuje se bajt po bajt s
+  izračunatim, pa je `R` kriv i kad je ista točka zapisana drugim
+  bajtovima. Ključ se ne odbija ni kad je točka malog reda ni kad njegova
+  32 bajta nisu svedena (y nije manji od p). To su bajtovi točke, a ne
+  tekst ključa iz natuknice iznad. Izvedba koja provjerava s kofaktorom
+  ili odbija takve ključeve može za iste bajtove dati drugi ishod.
 
 ## 5. TLS
 
@@ -212,9 +221,12 @@ bajtovima -62135596800) znači da zapis ne ističe. Samo to vrijeme znači
 istekao. Članstvo bez isteka koje je izdao ovlašteni primatelj traje dulje
 od svake ovlasti koja ističe. Da je `expiresAt` prije `issuedAt`, ne
 provjerava se: i takav zapis vrijedi do svog `expiresAt`, kao svaki drugi.
+U trenutku `issuedAt` takvo je članstvo već isteklo, pa ne veže ključ uz
+potpis autora verzije (odjeljak 11, „Potpis autora”).
 
 Članstvo vrijedi kad: potpis vrijedi, mreža je prava, ključ računala je
-onaj koji je dokazan u TLS-u, nije opozvano i nije isteklo. Isteklo
+onaj koji je dokazan u TLS-u, `network` i `deviceKey` pisani su kanonskim
+tekstom ključa (odjeljak 4), nije opozvano i nije isteklo. Isteklo
 članstvo za razmjenu vrijedi još 30 dana pričuve, da istek sam ne raspadne
 mrežu. Kad za isto ime računala vrijede dva članstva s različitim
 ključem, vrijedi ono koje je prvo izdano.
@@ -378,7 +390,7 @@ Tijelo je JSON:
 
 | Polje | Značenje |
 |---|---|
-| `ver` | 1 |
+| `ver` | inačica tijela: šalje se 1, prima se 1 ili veća |
 | `sesija` | 16 nasumičnih bajtova kao 32 heksadecimalna znaka |
 | `od`, `za` | javni ključ pošiljatelja i primatelja |
 | `sastajaliste` | javni ključ sastajališta preko kojeg poruka ide |
@@ -678,10 +690,13 @@ bijeg, kao u odjeljku 9.
 - Sva polja su uvijek tu. Prazan kanal i prazan `supersedes` pišu se kao
   `""`.
 - `created_at` su cijele sekunde Unix vremena iz polja `created_at`
-  verzije. Dio ispod sekunde otpada, jer ne preživi svaki put. Verzija
-  bez `created_at` potpisuje se s -62135596800, nultim vremenom u Gou.
-- `kljuc_autora` je javni ključ autora u zapisu iz odjeljka 4, isti koji
-  putuje uz verziju, znak po znak.
+  verzije. Vrijeme se zaokružuje nadolje na cijelu sekundu, jer dio ispod
+  sekunde ne preživi svaki put. Prije 1970. to nije isto što i rezanje
+  dijela sekunde: `1969-12-31T23:59:59.5Z` daje -1, a ne 0. Verzija bez
+  `created_at` potpisuje se s -62135596800, nultim vremenom u Gou.
+- `kljuc_autora` je tekst ključa autora točno kakav putuje uz verziju,
+  znak po znak. Pisac ga piše kanonskim tekstom iz odjeljka 4. O drugom
+  zapisu istog ključa vidi niže.
 - `sadrzaj` je SHA-256 bajtova polja `payload` u obliku u kojem ide
   žicom, kao 64 mala heksadecimalna znaka. To nije otisak sadržaja iz
   odjeljka 16. Oblik sa žice nastaje ovako: izbace se razmaci i novi
@@ -690,17 +705,30 @@ bijeg, kao u odjeljku 9.
   postojeći bijegovi, zapis brojeva (`1.0`, `1e2`), redoslijed ključeva i
   ponovljeni ključevi. Sadržaj se zato ne smije pročitati u strukturu pa
   ponovno zapisati. Isti zapis tako daje isti otisak i kad ga je računalo
-  spremilo s razmacima. Verzija bez `payload` potpisuje se kao da je
-  `payload` `null`. Sadržaj koji nije jedna JSON vrijednost ne da se
+  spremilo s razmacima. Sadržaj koji nije jedna JSON vrijednost ne da se
   potpisati.
+- Polje `payload` je obavezno. Sadržaj `null` smije se poslati samo
+  izričito, kao `"payload":null`. Verziju bez polja `payload` Go pri
+  prvom primanju potpis provjerava kao da je `payload` `null`, ali je
+  sprema s praznim sadržajem i više je ne šalje dalje. Druga izvedba je
+  zato ne smije pisati.
 
-Go polje `potpis` čita blago: preskače znakove CR i LF usred niza i ne
-gleda bitove zadnjeg znaka koji ne nose podatak. Isti potpis zato može
-stići zapisan na više načina, i Go svaki takav prima, sprema i šalje
-dalje kakav je stigao. Izvedba koja potpis čita strože takav bi proglasila
-krivim, pa ga mora čitati jednako blago. Za `kljuc_autora` to ne vrijedi:
-on ulazi u potpisane bajtove kakav je napisan, pa njegov drugi zapis
-kvari potpis.
+Go polje `potpis` čita blago: preskače znakove CR i LF bilo gdje u
+tekstu, i na kraju i unutar dopune `=`, i ne gleda bitove zadnjeg znaka
+koji ne nose podatak. Isti potpis zato može stići zapisan na više
+načina, i Go svaki takav prima, sprema i šalje dalje kakav je stigao.
+Izvedba koja potpis čita strože takav bi proglasila krivim, pa ga mora
+čitati jednako blago.
+
+`kljuc_autora` se čita jednako blago kao `potpis`. U potpisane bajtove
+ulazi kakav je napisan, pa potpis vrijedi samo nad tim tekstom. S
+`deviceKey` članstva uspoređuje se znak po znak, a članstvo vrijedi samo
+s kanonskim tekstom ključa (odjeljak 4). Verzija čiji ključ nije pisan
+kanonskim tekstom zato može imati ispravan potpis, ali ključ nikad nije
+vezan i ona čeka.
+
+Sam potpis provjerava se kao svaki potpis Ed25519 u protokolu (odjeljak
+4).
 
 Promjena bilo kojeg od ovih podataka kvari potpis. Ime protokola u oznaci
 znači da potpis iz mreže s drugim imenom protokola ovdje ne vrijedi.
@@ -710,20 +738,11 @@ Potpis pokriva sadržaj, pa ne može stajati u njemu. Zato su `potpis` i
 oznaku mogućnosti (odjeljak 19, pravilo 7), a u paketu kao neobavezna
 polja (odjeljak 17).
 
-Vektor `potpisVerzije` u `vektori-zice.json` ima dvije verzije, `obicna`
-i `posebniZnakovi`. Za svaku su tu podaci kako stoje u knjizi, sadržaj u
-obliku sa žice, njegov otisak, bajtovi koji se potpisuju, ključ autora i
-potpis. Druga verzija ima kanal, `supersedes`, `archived`, ime autora
-`a<b>&c`, sadržaj s razmacima i znakovima `<`, `>`, `&` i U+2028 te
-vrijeme s dijelom sekunde. Privatni ključ autora je `ulaz.sjemeA` iz iste
-datoteke, pa se potpis da ponoviti, a ne samo provjeriti.
-`deltaSPotpisom` u `vektori-razgovora.json` je delta s potpisanom
-verzijom kako ide žicom.
-
-Vektori pokazuju samo bajtove. Još nemaju sadržaj s brojem `1.0` ili
-postojećim bijegom, U+2028 u potpisanom tekstnom polju, potpis zapisan
-na drugi način, potpisan redak paketa ni odluke primatelja: kriv potpis,
-samo jedno polje, ključ koji nije vezan, članstvo u istoj delti, strože
+Ispitni vektori potpisa verzije su `potpisVerzije` u `vektori-zice.json`
+i `deltaSPotpisom` u `vektori-razgovora.json`. Što sadrže, piše u
+`vektori/README.md`. Ne pokrivaju potpisan redak paketa, sadržaj s
+ponovljenim ključevima ni odluke primatelja koje ovise o knjizi i
+članstvima: ključ koji nije vezan, članstvo u istoj delti, strože
 pravilo i dopunu.
 
 **Slanje.** `potpis` i `kljuc_autora` idu uz verziju samo kad obje strane
@@ -747,21 +766,30 @@ najveće verzije (odjeljak 10, korak 5).
   odbilo (odjeljak 14.3), i kad je u kanalu koji računalo ne prati.
   Pošiljatelj je zato uz oznaku `granica-odbijenih/1` ne šalje ponovno.
 - Ispravan potpis vrijedi tek kad je taj ključ vezan uz ime iz
-  `node_id`. Ključ je vezan kad pod tim imenom postoji članstvo s tim
-  ključem koje vrijedi kao u trenutku svog `issuedAt`: vrijede potpis i
-  mreža, a kad ga je izdao ovlašteni primatelj, i njegova ovlast u tom
-  trenutku i rok koji nije dulji od ovlasti. Ne gledaju se sat
-  primatelja, istek, opoziv ni pravilo prvog izdanog članstva iz
-  odjeljka 7. Vezan je svaki ključ za koji takvo članstvo postoji, pa
-  opoziv ne poništava verzije potpisane tim ključem. Pod imenom
-  primatelja vrijedi i njegov vlastiti ključ.
+  `node_id`. Ključ je vezan kad pod tim imenom postoji članstvo čiji je
+  `deviceKey` znak po znak jednak `kljuc_autora` i koje vrijedi kao u
+  trenutku svog `issuedAt`: vrijede potpis i mreža, a kad ga je izdao
+  ovlašteni primatelj, i njegova ovlast u tom trenutku i rok koji nije
+  dulji od ovlasti. Ne gledaju se sat primatelja, opoziv ni pravilo prvog
+  izdanog članstva iz odjeljka 7. Istek se gleda samo u trenutku
+  `issuedAt`: članstvo kojem je `expiresAt` prije `issuedAt` u tom je
+  trenutku već isteklo i ne veže ključ. Vezan je svaki ključ za koji
+  takvo članstvo postoji, pa opoziv ne poništava verzije potpisane tim
+  ključem. Pod imenom primatelja vrijedi i njegov vlastiti ključ.
 - Članstvo putuje kao verzija vrste zapisa koju zadaje aplikacija
   (odjeljak 3), a `payload` takve verzije je zapis članstva iz odjeljka
-  7. Računaju se članstva koja primatelj već zna i živa (neobrisana)
-  članstva iz iste delte ili istog paketa koja se u tom primanju i sama
-  upisuju. Članstvo koje i samo čeka, koje primatelj ne prihvati ili je u
-  kanalu koji ne prati ne veže ključ. Zato primatelj potpise provjeri još
-  jednom, nad onim što upisuje. Verzija čiji ključ tada nije vezan čeka.
+  7. Računaju se članstva koja primatelj već zna i članstva iz živih
+  (neobrisanih) verzija iste delte ili istog paketa. Primatelj potpise
+  provjeri dvaput: prvi put nad svim primljenim verzijama, drugi put nad
+  verzijama koje su prošle prvu provjeru i koje želi upisati. Članstvo
+  koje primatelj ne prihvati, koje je u kanalu koji ne prati ili čija
+  verzija ne prođe prvu provjeru ne ide u drugu provjeru, pa tu ne veže
+  ključ. Verzija čiji ključ tada nije vezan čeka. Članstvo iz verzija
+  koje idu u drugu provjeru veže ključ i kad njegova verzija tu i sama
+  čeka, pa se ne upiše. Go paket upisuje u serijama od najviše 2000
+  verzija, članstva prva, i drugu provjeru radi za svaku seriju zasebno.
+  Članstvo koje u jednoj seriji čeka zato ne veže ključ verzijama iz
+  kasnijih serija.
 - Kad ključ još nije vezan uz ime, verzija čeka. Ne upisuje se i ne ide u
   granicu odbijenih, pa je pošiljatelj šalje ponovno sve dok je granica
   primatelja za taj ključ granice ispod nje. Zato primatelj za taj ključ
@@ -793,6 +821,11 @@ Autor smije naknadno potpisati i svoje verzije napisane prije nego što je
 počeo potpisivati, istim bajtovima i svojim ključem, ali samo one koje je
 sam napisao, ne one koje je pod svojim imenom primio. Tada ih šalje
 potpisane, a primatelj koji traži potpis za tu vrstu zapisa prima ih.
+Go to razlikuje tek otkad uz verziju pamti vrijeme primanja. Starije
+verzije pod svojim imenom ne može razlikovati. Zato naknadno potpiše sve
+takve verzije onih vrsta zapisa za koje traži potpis, osim kad pod tim
+imenom postoji članstvo s drugim ključem ili se članstva ne daju
+pročitati.
 
 ### Sukob dviju izmjena
 
