@@ -33,10 +33,10 @@
 //! never does, so it has to compare the text as written.
 
 use crate::identity::{parse_public_key_bytes, public_key_to_base64};
-use crate::trust::rfc3339_unix::parse_utc;
 use crate::wire::conversation_v1::VersionV1;
 use crate::wire::go_base64::decode_std;
 use crate::wire::go_json::{go_raw_json_vec, to_go_json_vec};
+use crate::wire::go_time;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
@@ -180,6 +180,18 @@ pub fn verify_version_signature(
         .map_err(|_| VersionSignatureError::BadSignature)
 }
 
+/// The time of a version as Go reads its `created_at` (a `time.Time`, see
+/// [`go_time`]): the text is already unescaped, as Go unescapes it first. Where Go fails
+/// to read the time it turns the version away, so here it is [`BadCreatedAt`]. The
+/// signature covers whole seconds, so a part of a second does not count.
+///
+/// [`BadCreatedAt`]: VersionSignatureError::BadCreatedAt
+fn created_at_unix(text: &str) -> Result<i64, VersionSignatureError> {
+    go_time::parse(text.as_bytes())
+        .map(|t| t.unix)
+        .ok_or(VersionSignatureError::BadCreatedAt)
+}
+
 /// Checks the author's signature of a version as it came in a conversation.
 ///
 /// `Unsigned` only when both `potpis` and `kljuc_autora` are empty; with either of them the
@@ -197,8 +209,7 @@ pub fn verify_version_v1(protocol: &str, version: &VersionV1) -> Result<(), Vers
         archived: version.archived,
         channel: version.channel.as_deref().unwrap_or(""),
         schema_version: i64::from(version.schema_version),
-        created_at_unix: parse_utc(&version.created_at)
-            .map_err(|_| VersionSignatureError::BadCreatedAt)?,
+        created_at_unix: created_at_unix(&version.created_at)?,
         payload: version.payload.get(),
     };
     verify_version_signature(protocol, &data, &version.potpis, &version.kljuc_autora)
@@ -250,7 +261,7 @@ mod tests {
                 archived: vector["ulaz"]["archived"].as_bool().unwrap(),
                 channel: input("channel"),
                 schema_version: vector["ulaz"]["schema_version"].as_i64().unwrap(),
-                created_at_unix: parse_utc(input("created_at")).unwrap(),
+                created_at_unix: created_at_unix(input("created_at")).unwrap(),
                 payload: input("payload"),
             };
 
@@ -651,5 +662,62 @@ mod tests {
             verify_version_v1("gocop", version),
             Err(VersionSignatureError::Unsigned)
         );
+    }
+
+    /// `created_at` as Go's version reads it (`json.Unmarshal` into the ledger's version,
+    /// go1.27.1): the Unix seconds, or `GRESKA` where Go fails to read it. The value is
+    /// the JSON text; Rust reads it into the version's text field first, as the
+    /// conversation does.
+    const CREATED_AT: &[(&str, &str)] = &[
+        (r#""2025-10-09T08:54:00Z""#, "1760000040"),
+        (r#""2025-10-09T08:53:60Z""#, "GRESKA"),
+        (r#""2025-10-09T08:54:00z""#, "GRESKA"),
+        (r#""2025-10-09t08:54:00Z""#, "GRESKA"),
+        (r#""2025-02-31T00:00:00Z""#, "GRESKA"),
+        (r#""2025-04-31T00:00:00Z""#, "GRESKA"),
+        (r#""2025-10-09T8:54:00Z""#, "1760000040"),
+        (r#""2025-10-09T08:54:00,5Z""#, "1760000040"),
+        (r#""2025-10-09T08:54:00.5Z""#, "1760000040"),
+        (r#""2025-10-09T08:54:00+24:00""#, "1759913640"),
+        (r#""2025-10-09T08:54:00+23:59""#, "1759913700"),
+        (r#""2025-10-09T08:54:00Z""#, "1760000040"),
+        (r#""2025-10-09 08:54:00Z""#, "GRESKA"),
+        ("1760000040", "GRESKA"),
+        (r#""""#, "GRESKA"),
+    ];
+
+    #[test]
+    fn created_at_reads_as_in_go() {
+        for (raw, go) in CREATED_AT {
+            let rust = serde_json::from_str::<String>(raw)
+                .ok()
+                .and_then(|text| created_at_unix(&text).ok())
+                .map_or_else(|| "GRESKA".to_owned(), |unix| unix.to_string());
+            assert_eq!(rust, *go, "{raw}");
+        }
+
+        // The signature covers the seconds only, so a time Go does not read must not pass
+        // here under a signature made for the same seconds written properly.
+        let author = SigningKey::from_bytes(&[1; 32]);
+        let k = public_key_to_base64(author.verifying_key().as_bytes());
+        let s = sign_edge_over(&author, &k);
+        for (created_at, want) in [
+            ("2025-10-09T08:53:20Z", Ok(())),
+            ("2025-10-09T10:53:20+02:00", Ok(())),
+            ("2025-10-09T8:53:20Z", Ok(())),
+            ("2025-10-09T08:53:20,5Z", Ok(())),
+            (
+                "2025-10-09T08:53:20z",
+                Err(VersionSignatureError::BadCreatedAt),
+            ),
+            (
+                "2025-10-09t08:53:20Z",
+                Err(VersionSignatureError::BadCreatedAt),
+            ),
+        ] {
+            let mut version = edge_version(&s, &k);
+            version.created_at = created_at.to_owned();
+            assert_eq!(verify_version_v1("gocop", &version), want, "{created_at}");
+        }
     }
 }
