@@ -147,6 +147,10 @@ jedan za drugim.
    kao bajtovi), broj pozivatelja, broj pozvanog. Prva četiri bajta sažetka
    čitaju se kao broj bez predznaka (big-endian), uzima se ostatak pri
    dijeljenju s 1 000 000 i piše sa šest znamenki, s vodećim nulama.
+   Ispitni vektor `uparivanje.kodSNulom` daje kod koji počinje nulom
+   (`020062`). Izvedba koja kod piše bez vodećih nula na njemu padne.
+   Vektor `uparivanje.kodSNajvisimBitom` ima sažetak koji počinje bajtom
+   `0xc5`, pa na njemu padne izvedba koja broj čita s predznakom.
 4. Oba čovjeka usporede kod i potvrde. Svaka strana pošalje
    `Confirm`: `{"approved": true|false, "payload": …}`. Ništa se ne sprema
    dok obje strane ne potvrde.
@@ -156,6 +160,12 @@ mreže, članstvo pošiljatelja i, kad pošiljatelj smije primati članove,
 novo članstvo za drugu stranu.
 
 Granice: `Hello` 64 KiB, korak koda 4 KiB, `Confirm` 1 MiB.
+
+Napomena: obje strane pošalju `Hello` (ime računala, ime za prikaz,
+izdanje i `meta`) prije dogovora koda. Dok računalo čeka uparivanje, te
+podatke dobije svatko tko se spoji na port uparivanja, i bez koda. To je
+poznato i otvoreno pitanje koje treba riješiti prije prvog izdanja.
+Protokol se zbog toga zasad ne mijenja.
 
 ## 7. Članstvo, ovlast i opoziv
 
