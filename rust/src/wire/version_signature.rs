@@ -32,7 +32,7 @@
 //! for good. A receiver that binds by the decoded key bytes instead would take in what Go
 //! never does, so it has to compare the text as written.
 
-use crate::identity::public_key_to_base64;
+use crate::identity::{parse_public_key_bytes, public_key_to_base64};
 use crate::trust::rfc3339_unix::parse_utc;
 use crate::wire::conversation_v1::VersionV1;
 use crate::wire::go_base64::decode_std;
@@ -168,10 +168,8 @@ pub fn verify_version_signature(
     signature: &str,
     author_key: &str,
 ) -> Result<(), VersionSignatureError> {
-    let key: [u8; 32] = decode_std(author_key)
-        .ok()
-        .and_then(|raw| raw.try_into().ok())
-        .ok_or(VersionSignatureError::BadAuthorKey)?;
+    let key =
+        parse_public_key_bytes(author_key).map_err(|_| VersionSignatureError::BadAuthorKey)?;
     let bytes = version_signing_bytes(protocol, v, author_key)?;
     let key = VerifyingKey::from_bytes(&key).map_err(|_| VersionSignatureError::BadSignature)?;
     let signature = decode_std(signature)

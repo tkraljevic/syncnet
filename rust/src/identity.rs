@@ -1,3 +1,4 @@
+use crate::wire::go_base64::decode_std;
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -67,14 +68,26 @@ pub fn verifying_key_to_base64(vk: &VerifyingKey) -> String {
     public_key_to_base64(vk.as_bytes())
 }
 
-pub fn parse_public_key(s: &str) -> Result<VerifyingKey, IdentityError> {
-    let bytes = STANDARD
-        .decode(s.trim())
-        .map_err(|e| IdentityError::InvalidPublicKey(e.to_string()))?;
-    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+/// Reads a public key from the wire as the Go implementation reads one: base64 as Go reads it
+/// (`wire::go_base64`, so no trimming, `\r` and `\n` skipped, leftover bits ignored) and
+/// exactly 32 bytes.
+///
+/// Whether the bytes are a point of the curve is not checked here. Go checks that only when
+/// it verifies a signature under the key, and then a key that is not a point is a bad
+/// signature, not a bad key. A reader that must tell the two apart, as Go does, reads with
+/// this and then `VerifyingKey::from_bytes`.
+pub fn parse_public_key_bytes(s: &str) -> Result<[u8; 32], IdentityError> {
+    let bytes = decode_std(s).map_err(|e| IdentityError::InvalidPublicKey(e.to_string()))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
         IdentityError::InvalidPublicKey(format!("ocekivano 32 B, dobiveno {} B", v.len()))
-    })?;
-    VerifyingKey::from_bytes(&arr).map_err(|e| IdentityError::InvalidPublicKey(e.to_string()))
+    })
+}
+
+/// [`parse_public_key_bytes`] and then the point of the curve: both a key that does not
+/// read and one that is not a point are `InvalidPublicKey`.
+pub fn parse_public_key(s: &str) -> Result<VerifyingKey, IdentityError> {
+    VerifyingKey::from_bytes(&parse_public_key_bytes(s)?)
+        .map_err(|e| IdentityError::InvalidPublicKey(e.to_string()))
 }
 
 pub fn principal_id_from_key(pub_bytes: &[u8; 32]) -> String {
@@ -271,9 +284,220 @@ fn sanitize_name_for_msg(name: &str) -> String {
     }
 }
 
+/// The edges of a public key on the wire, shared by the tests of every reader of one.
+///
+/// Each reader has its own table of what Go makes of these texts at the same place on the
+/// wire. The names are the ones the Go probe prints.
+#[cfg(test)]
+pub(crate) mod key_edges {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    /// Who signs the record that carries the key.
+    pub(crate) enum EdgeSigner {
+        Key(SigningKey),
+        /// `R || 0`: holds under a small-order key whenever `[k]A` comes out as `R`.
+        Forged([u8; 32]),
+    }
+
+    impl EdgeSigner {
+        pub(crate) fn sign(&self, msg: &[u8]) -> [u8; 64] {
+            match self {
+                Self::Key(sk) => sk.sign(msg).to_bytes(),
+                Self::Forged(r) => {
+                    let mut sig = [0u8; 64];
+                    sig[..32].copy_from_slice(r);
+                    sig
+                }
+            }
+        }
+    }
+
+    pub(crate) struct KeyEdge {
+        pub(crate) name: &'static str,
+        pub(crate) key: String,
+        pub(crate) signer: EdgeSigner,
+    }
+
+    /// The signer of every edge that is not about a key of its own.
+    pub(crate) fn edge_signer() -> SigningKey {
+        SigningKey::from_bytes(&[1; 32])
+    }
+
+    /// Flips the lowest bit of the last character before the padding: the bytes stay the
+    /// same, the text is no longer the canonical one.
+    pub(crate) fn with_trailing_bit(text: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let data = text.trim_end_matches('=');
+        let last = data.len() - 1;
+        let c = ALPHABET
+            .iter()
+            .position(|&a| a == data.as_bytes()[last])
+            .unwrap();
+        format!(
+            "{}{}{}",
+            &data[..last],
+            ALPHABET[c ^ 1] as char,
+            &text[data.len()..]
+        )
+    }
+
+    pub(crate) fn key_edges() -> Vec<KeyEdge> {
+        let k = public_key_to_base64(edge_signer().verifying_key().as_bytes());
+        assert_eq!(k, "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=");
+        let raw = STANDARD.decode(&k).unwrap();
+        // A key with + and / in it, for the URL-safe alphabet.
+        let other = SigningKey::from_bytes(&[2; 32]);
+        let k2 = public_key_to_base64(other.verifying_key().as_bytes());
+        assert_eq!(k2, "gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=");
+
+        // The identity point (order 1) in three encodings, and (0, -1) of order 2.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut identity_y_plus_p = [0xffu8; 32];
+        identity_y_plus_p[0] = 0xee;
+        identity_y_plus_p[31] = 0x7f;
+        let mut identity_signed = identity;
+        identity_signed[31] = 0x80;
+        let mut order_two = [0xffu8; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        // y = 2 is not a point of the curve.
+        let mut not_a_point = [0u8; 32];
+        not_a_point[0] = 2;
+
+        let by = |name, key: String| KeyEdge {
+            name,
+            key,
+            signer: EdgeSigner::Key(edge_signer()),
+        };
+        let forged = |name, key: [u8; 32], r: [u8; 32]| KeyEdge {
+            name,
+            key: STANDARD.encode(key),
+            signer: EdgeSigner::Forged(r),
+        };
+        vec![
+            by("ispravno", k.clone()),
+            by("prazno", String::new()),
+            by("samo_razmak", " ".into()),
+            by("nije_base64", "nije kljuc".into()),
+            by("31B", STANDARD.encode(&raw[..31])),
+            by("33B", STANDARD.encode([&raw[..], &[0]].concat())),
+            by("bez_paddinga", k.trim_end_matches('=').into()),
+            by("visak_paddinga", format!("{k}=")),
+            by("razmak_ispred", format!(" {k}")),
+            by("razmak_iza", format!("{k} ")),
+            by("tab_iza", format!("{k}\t")),
+            by("novi_red_ispred", format!("\n{k}")),
+            by("novi_red_iza", format!("{k}\n")),
+            by("crlf_iza", format!("{k}\r\n")),
+            by("novi_red_u_sredini", format!("{}\n{}", &k[..20], &k[20..])),
+            by("visak_bitova", with_trailing_bit(&k)),
+            KeyEdge {
+                name: "url_safe",
+                key: k2.replace('+', "-").replace('/', "_"),
+                signer: EdgeSigner::Key(other.clone()),
+            },
+            KeyEdge {
+                name: "url_safe_kanonski",
+                key: k2,
+                signer: EdgeSigner::Key(other),
+            },
+            by("nije_tocka", STANDARD.encode(not_a_point)),
+            forged("identitet", identity, identity),
+            forged("identitet_nekanonski_y", identity_y_plus_p, identity),
+            forged("identitet_s_predznakom", identity_signed, identity),
+            forged("red2_R_identitet", order_two, identity),
+            forged("red2_R_tocka", order_two, order_two),
+        ]
+    }
+
+    /// Runs `outcome` over every edge and fails with each edge where it is not what Go
+    /// gives. `table` is `(edge, Go, Rust before)`; the last column is a record only, it
+    /// shows where Rust used to differ. A Go column of `-` is a case Go cannot answer (the
+    /// signed bytes are not the same); `outcome` still runs, but nothing is compared.
+    pub(crate) fn assert_edges_as_in_go(
+        table: &[(&str, &str, &str)],
+        mut outcome: impl FnMut(&KeyEdge) -> String,
+    ) {
+        let edges = key_edges();
+        let mut wrong = Vec::new();
+        for edge in &edges {
+            let Some((_, go, _before)) = table.iter().find(|row| row.0 == edge.name) else {
+                wrong.push(format!("{}: no row in the table", edge.name));
+                continue;
+            };
+            let got = outcome(edge);
+            if *go != "-" && got != *go {
+                wrong.push(format!("{}: Go {go}, Rust {got}", edge.name));
+            }
+        }
+        for (name, _, _) in table {
+            if !edges.iter().any(|e| e.name == *name) {
+                wrong.push(format!("{name}: no such edge"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader reads as the Go implementation reads a public key. The Rust column is the
+    /// old `parse_public_key`, which trimmed and then read strictly, and checked the point.
+    #[test]
+    fn public_key_reads_as_in_go() {
+        use key_edges::{assert_edges_as_in_go, key_edges};
+
+        #[rustfmt::skip]
+        let table = [
+            ("ispravno", "procitan", "procitan"),
+            ("prazno", "greska", "greska"),
+            ("samo_razmak", "greska", "greska"),
+            ("nije_base64", "greska", "greska"),
+            ("31B", "greska", "greska"),
+            ("33B", "greska", "greska"),
+            ("bez_paddinga", "greska", "greska"),
+            ("visak_paddinga", "greska", "greska"),
+            ("razmak_ispred", "greska", "procitan"),
+            ("razmak_iza", "greska", "procitan"),
+            ("tab_iza", "greska", "procitan"),
+            ("novi_red_ispred", "procitan", "procitan"),
+            ("novi_red_iza", "procitan", "procitan"),
+            ("crlf_iza", "procitan", "procitan"),
+            ("novi_red_u_sredini", "procitan", "greska"),
+            ("visak_bitova", "procitan", "greska"),
+            ("url_safe", "greska", "greska"),
+            ("url_safe_kanonski", "procitan", "procitan"),
+            ("nije_tocka", "procitan", "greska"),
+            ("identitet", "procitan", "procitan"),
+            ("identitet_nekanonski_y", "procitan", "procitan"),
+            ("identitet_s_predznakom", "procitan", "procitan"),
+            ("red2_R_identitet", "procitan", "procitan"),
+            ("red2_R_tocka", "procitan", "procitan"),
+        ];
+        assert_edges_as_in_go(&table, |edge| {
+            match parse_public_key_bytes(&edge.key) {
+                Ok(_) => "procitan",
+                Err(_) => "greska",
+            }
+            .into()
+        });
+
+        // With the point on top, only the key that is not a point changes; small-order
+        // points are points, and Go does not refuse them either.
+        for edge in key_edges() {
+            let bytes = parse_public_key_bytes(&edge.key);
+            let key = parse_public_key(&edge.key);
+            if edge.name == "nije_tocka" {
+                assert!(bytes.is_ok() && key.is_err());
+            } else {
+                assert_eq!(bytes.ok(), key.ok().map(|k| k.to_bytes()), "{}", edge.name);
+            }
+        }
+    }
 
     #[test]
     fn key_persistence_never_overwrites_existing_or_corrupt_file() {

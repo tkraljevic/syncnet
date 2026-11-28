@@ -4,6 +4,8 @@ use crate::{
     wire::{
         conversation_v1::{ConversationV1Error, read_line_bytes},
         frame::{FrameError, read_frame_async, write_frame_async},
+        go_bytes,
+        go_object::{Field, Schema, go_struct},
     },
 };
 use ed25519_dalek::SigningKey;
@@ -81,35 +83,6 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
-mod opt_base64 {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match bytes {
-            Some(b) => serializer.serialize_str(&STANDARD.encode(b)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        match opt {
-            Some(s) => STANDARD
-                .decode(s.trim())
-                .map(Some)
-                .map_err(|e| D::Error::custom(format!("neispravan base64 u SAS poruci: {e}"))),
-            None => Ok(None),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairIdentity {
     pub protocol: String,
@@ -151,13 +124,29 @@ pub struct PairHello {
     pub sas: u32,
 }
 
+/// Read as Go reads the code-agreement message (see [`crate::wire::go_object`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct SasWireMessage {
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_base64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "go_bytes::opt"
+    )]
     pub obveza: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_base64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "go_bytes::opt"
+    )]
     pub broj: Option<Vec<u8>>,
 }
+
+pub(crate) const SAS_SCHEMA: Schema = Schema {
+    fields: &[Field::nullable("obveza"), Field::nullable("broj")],
+    baseline: &[],
+};
+go_struct!(SasWireMessage, SAS_SCHEMA);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairConfirm {
@@ -365,12 +354,11 @@ where
     let reply_raw = read_pairing_msg(stream, MAX_SAS_MSG_LEN, line_json).await?;
     let reply: SasWireMessage = serde_json::from_slice(&reply_raw)
         .map_err(|e| PairingError::Serialization(e.to_string()))?;
+    // As in Go, each step looks only at the length of the field it needs; the other one
+    // may come along.
     let Some(listener_vec) = reply.broj else {
         return Err(PairingError::InvalidCommit);
     };
-    if reply.obveza.is_some() {
-        return Err(PairingError::InvalidCommit);
-    }
     let listener_nonce: [u8; SAS_NONCE_LEN] = listener_vec
         .try_into()
         .map_err(|_| PairingError::InvalidCommit)?;
@@ -412,7 +400,7 @@ where
     let Some(commit_vec) = commit_msg.obveza else {
         return Err(PairingError::InvalidCommit);
     };
-    if commit_msg.broj.is_some() || commit_vec.len() != 32 {
+    if commit_vec.len() != 32 {
         return Err(PairingError::InvalidCommit);
     }
 
@@ -430,10 +418,7 @@ where
     let Some(caller_vec) = reveal_msg.broj else {
         return Err(PairingError::InvalidCommit);
     };
-    if reveal_msg.obveza.is_some()
-        || caller_vec.len() != SAS_NONCE_LEN
-        || !verify_sas_commit(protocol, &caller_vec, &commit_vec)
-    {
+    if caller_vec.len() != SAS_NONCE_LEN || !verify_sas_commit(protocol, &caller_vec, &commit_vec) {
         return Err(PairingError::InvalidCommit);
     }
 
@@ -1203,6 +1188,149 @@ mod tests {
             negotiate_sas_listener_async(&mut s4, "list2cart", &listener_nonce).await,
             Err(PairingError::InvalidCommit)
         ));
+    }
+
+    /// The number in a code-agreement message, 32 bytes of 0x11, written as it may come
+    /// off the wire. What Go's `json.Decoder` makes of each, measured with go1.27.1: the
+    /// same 32 bytes, an error, or nothing (`null`). Spaces and tabs at the edge used to be
+    /// trimmed here; Go refuses them.
+    #[test]
+    fn sas_number_reads_as_go_reads_bytes() {
+        let b64 = "ERERERERERERERERERERERERERERERERERERERERERE=";
+        let nums = vec!["17"; 32].join(",");
+        let cases = [
+            (format!("\"{b64}\""), "isti"),
+            (format!("\"{}F=\"", &b64[..42]), "isti"),
+            (format!("\"{}\\n{}\"", &b64[..20], &b64[20..]), "isti"),
+            (format!("[{nums}]"), "isti"),
+            (format!("\"{b64}\\n\""), "isti"),
+            (format!("\" {b64}\""), "greska"),
+            (format!("\"{b64} \""), "greska"),
+            (format!("\"{b64}\\t\""), "greska"),
+            (format!("\"\\t{b64}\""), "greska"),
+            ("null".to_owned(), "prazno"),
+        ];
+        for (value, go) in cases {
+            let wire = format!(r#"{{"broj":{value}}}"#);
+            let got = match serde_json::from_str::<SasWireMessage>(&wire) {
+                Err(_) => "greska",
+                Ok(m) if m.broj.as_deref() == Some([0x11u8; 32].as_slice()) => "isti",
+                Ok(m) if m.broj.is_none() => "prazno",
+                Ok(_) => "drugo",
+            };
+            assert_eq!(got, go, "{wire}");
+        }
+    }
+
+    /// Code agreement with the other side's messages written by hand. The Go column is
+    /// the Go side's caller and listener steps over a `json.Decoder`, measured with
+    /// go1.27.1: each step looks only at the length of the field it needs, so the other
+    /// field may come along, empty or not. `{N}` is 32 bytes of 0x11, `{O}` the commitment
+    /// to it, `{W}` 32 bytes of 0x33.
+    #[tokio::test]
+    async fn sas_steps_decide_as_go() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let protocol = "gocop";
+        let n = [0x11u8; SAS_NONCE_LEN];
+        let nb = STANDARD.encode(n);
+        let ob = STANDARD.encode(compute_sas_commit(protocol, &n));
+        assert_eq!(ob, "1P8DnN/lQvCaXqYRRfiIgK7UM0K0P7K8w7STPpG5dEo=");
+        let wb = STANDARD.encode([0x33u8; SAS_NONCE_LEN]);
+        let fill = |s: &str| {
+            s.replace("{N}", &nb)
+                .replace("{O}", &ob)
+                .replace("{W}", &wb)
+        };
+        let mine = [0x22u8; SAS_NONCE_LEN];
+
+        // The listener's answer to the caller.
+        let caller = [
+            (r#"{"broj":"{N}"}"#, true),
+            (r#"{"obveza":"","broj":"{N}"}"#, true),
+            (r#"{"obveza":[],"broj":"{N}"}"#, true),
+            (r#"{"obveza":"AA==","broj":"{N}"}"#, true),
+            (r#"{"obveza":null,"broj":"{N}"}"#, true),
+            (r#"{"obveza":"{O}","broj":"{N}"}"#, true),
+            (r#"{"Broj":"{N}"}"#, true),
+            (r#"{"broj":"AA=="}"#, false),
+            (r#"{"broj":""}"#, false),
+            ("{}", false),
+            (r#"{"broj":"{N}","broj":null}"#, false),
+        ];
+        for (reply, go_ok) in caller {
+            let reply = fill(reply);
+            let (mut a, mut b) = tokio::io::duplex(16 * 1024);
+            let peer = {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                    let _ = write_frame_async(&mut b, reply.as_bytes(), MAX_SAS_MSG_LEN).await;
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                })
+            };
+            let got = negotiate_sas_caller_async(&mut a, protocol, &mine).await;
+            assert_eq!(got.is_ok(), go_ok, "pozivatelj {reply}: {got:?}");
+            if let Ok(nonce) = got {
+                assert_eq!(nonce, n);
+            }
+            drop(a);
+            let _ = peer.await;
+        }
+
+        // The caller's commitment and reveal to the listener.
+        let listener = [
+            (r#"{"obveza":"{O}"}"#, r#"{"broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}","broj":"AA=="}"#,
+                r#"{"broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"obveza":"{O}","broj":""}"#, r#"{"broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}","broj":"{N}"}"#,
+                r#"{"broj":"{N}"}"#,
+                true,
+            ),
+            (
+                r#"{"obveza":"{O}"}"#,
+                r#"{"obveza":"AA==","broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"obveza":"{O}"}"#, r#"{"obveza":"","broj":"{N}"}"#, true),
+            (
+                r#"{"obveza":"{O}"}"#,
+                r#"{"obveza":"{O}","broj":"{N}"}"#,
+                true,
+            ),
+            (r#"{"OBVEZA":"{O}"}"#, r#"{"BROJ":"{N}"}"#, true),
+            (r#"{"obveza":"AA=="}"#, r#"{"broj":"{N}"}"#, false),
+            (r#"{"obveza":"{O}"}"#, r#"{"broj":"{W}"}"#, false),
+            (
+                r#"{"obveza":"{O}","obveza":null}"#,
+                r#"{"broj":"{N}"}"#,
+                false,
+            ),
+            (r#"{"broj":"{N}"}"#, r#"{"broj":"{N}"}"#, false),
+        ];
+        for (commit, reveal, go_ok) in listener {
+            let (commit, reveal) = (fill(commit), fill(reveal));
+            let (mut a, mut b) = tokio::io::duplex(16 * 1024);
+            let peer = {
+                let (commit, reveal) = (commit.clone(), reveal.clone());
+                tokio::spawn(async move {
+                    let _ = write_frame_async(&mut b, commit.as_bytes(), MAX_SAS_MSG_LEN).await;
+                    let _ = read_frame_async(&mut b, MAX_SAS_MSG_LEN).await;
+                    let _ = write_frame_async(&mut b, reveal.as_bytes(), MAX_SAS_MSG_LEN).await;
+                })
+            };
+            let got = negotiate_sas_listener_async(&mut a, protocol, &mine).await;
+            assert_eq!(got.is_ok(), go_ok, "slusalica {commit} {reveal}: {got:?}");
+            if let Ok(nonce) = got {
+                assert_eq!(nonce, n);
+            }
+            drop(a);
+            let _ = peer.await;
+        }
     }
 
     #[test]
