@@ -2,6 +2,7 @@ use crate::identity::{parse_public_key, parse_public_key_bytes, public_key_to_ba
 use crate::wire::go_base64::decode_std;
 use crate::wire::go_json::to_go_json_vec;
 use crate::wire::go_object::{Field, Kind, Schema, go_struct};
+use crate::wire::go_time::GoTime;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -51,15 +52,21 @@ pub const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 /// only: [`Expiry::NEVER`] and `Expiry::from_wire_unix(GO_ZERO_TIME_UNIX)` are the same
 /// value. Read the time with [`Expiry::last_second`], which gives `None` for no expiry.
 ///
+/// A time read from the wire keeps the part of a second it was written with
+/// ([`Expiry::nanos`]), as Go keeps it: the signature covers whole seconds only, but Go
+/// compares two records' times in full, so here they are compared the same way. Go and
+/// Rust write whole seconds; a part of a second comes only from a record written by
+/// hand or changed on the way.
+///
 /// There is no `From<i64>` and no serde of its own: a number becomes an expiry only
 /// through [`Expiry::from_wire_unix`], and a record says how it writes one (the records
 /// here use [`rfc3339_unix::expiry`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Expiry(i64);
+pub struct Expiry(i64, u32);
 
 impl Expiry {
     /// No expiry. Written as Go's zero time.
-    pub const NEVER: Self = Self(GO_ZERO_TIME_UNIX);
+    pub const NEVER: Self = Self(GO_ZERO_TIME_UNIX, 0);
 
     /// The expiry a wire or signed `expiresAt` stands for: exactly
     /// [`GO_ZERO_TIME_UNIX`] is no expiry, anything else is that time, 0 too (1970).
@@ -69,30 +76,55 @@ impl Expiry {
     /// that 0 is 1970, and a record that should have no expiry passes the admitter's
     /// limit and holds for ever.
     pub const fn from_wire_unix(unix: i64) -> Self {
-        Self(unix)
+        Self(unix, 0)
     }
 
-    /// The `expiresAt` written on the wire and signed: [`GO_ZERO_TIME_UNIX`] for no
-    /// expiry. `Expiry::from_wire_unix(e.wire_unix()) == e`.
+    /// A time as read from the wire, with its part of a second.
+    pub(crate) const fn from_go_time(t: GoTime) -> Self {
+        Self(t.unix, t.nanos)
+    }
+
+    /// The `expiresAt` signed, and written on the wire with [`Expiry::nanos`]:
+    /// [`GO_ZERO_TIME_UNIX`] for no expiry. `Expiry::from_wire_unix(e.wire_unix()) == e`
+    /// when `e.nanos()` is 0.
     pub const fn wire_unix(self) -> i64 {
         self.0
     }
 
+    /// The part of a second past [`Expiry::wire_unix`] the record was written with, in
+    /// nanoseconds; 0 for a record Go or Rust issued. It is not signed.
+    pub const fn nanos(self) -> u32 {
+        self.1
+    }
+
+    /// The time as Go compares it.
+    const fn instant(self) -> Instant {
+        (self.0, self.1)
+    }
+
+    /// Whether it has passed at `at`, compared in full as Go compares it.
+    fn passed_at(self, at: Instant) -> bool {
+        !self.is_never() && at > self.instant()
+    }
+
+    /// Whether a record with this expiry runs longer than one with `limit`, as Go asks it:
+    /// no expiry runs longer than any time, and no limit is never exceeded.
+    fn runs_longer_than(self, limit: Self) -> bool {
+        !limit.is_never() && (self.is_never() || self.instant() > limit.instant())
+    }
+
     /// The last second it holds (Unix seconds), or `None` for no expiry.
     pub const fn last_second(self) -> Option<i64> {
-        if self.0 == GO_ZERO_TIME_UNIX {
-            None
-        } else {
-            Some(self.0)
-        }
+        if self.is_never() { None } else { Some(self.0) }
     }
 
     /// Whether this is no expiry.
     pub const fn is_never(self) -> bool {
-        self.0 == GO_ZERO_TIME_UNIX
+        self.0 == GO_ZERO_TIME_UNIX && self.1 == 0
     }
 
-    /// Whether it has passed at `at_unix`. The expiry second itself still holds.
+    /// Whether it has passed at `at_unix` (a whole second, as the clock is read here).
+    /// The expiry second itself still holds, with any part of a second.
     pub const fn is_expired_at(self, at_unix: i64) -> bool {
         match self.last_second() {
             Some(last) => at_unix > last,
@@ -101,11 +133,15 @@ impl Expiry {
     }
 }
 
+/// A time as Go compares two of them: Unix seconds, then the nanoseconds past them.
+type Instant = (i64, u32);
+
 impl fmt::Debug for Expiry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.last_second() {
             None => f.write_str("Expiry::NEVER"),
-            Some(unix) => write!(f, "Expiry({unix})"),
+            Some(unix) if self.1 == 0 => write!(f, "Expiry({unix})"),
+            Some(unix) => write!(f, "Expiry({unix}.{:09})", self.1),
         }
     }
 }
@@ -222,6 +258,7 @@ impl NetworkKey {
             device_key: public_key_to_base64(device_key.as_bytes()),
             issued_by: issued_by.to_owned(),
             issued_at,
+            issued_at_nanos: 0,
             expires_at: Validity {
                 issued_at,
                 valid_for_secs,
@@ -248,6 +285,7 @@ impl NetworkKey {
             device_key: public_key_to_base64(device_key.as_bytes()),
             issued_by: issued_by.to_owned(),
             issued_at: validity.issued_at,
+            issued_at_nanos: 0,
             expires_at: validity.expires_at()?,
             signature: String::new(),
             admitter: None,
@@ -262,23 +300,39 @@ impl NetworkKey {
 /// in any ASCII case, the last of a repeated field, and a missing field, or `null`, as
 /// Go's empty value: an empty text, and Go's zero time for a time, so a missing
 /// `expiresAt` is no expiry. The signature then decides, as in Go.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ovlast {
-    #[serde(default)]
     pub network: String,
-    #[serde(default)]
     pub device_id: String,
-    #[serde(default)]
     pub device_key: String,
-    #[serde(default)]
     pub issued_by: String,
-    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
+    /// The part of a second past `issued_at` the record was written with, in
+    /// nanoseconds, as Go keeps it (see [`Expiry`]). 0 for a record Go or Rust issued; it
+    /// is not signed, but Go compares it.
+    pub issued_at_nanos: u32,
     pub expires_at: Expiry,
-    #[serde(default)]
     pub signature: String,
+}
+
+/// An ovlast as the wire carries it, its times in full.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Self", rename_all = "camelCase")]
+struct OvlastWire {
+    #[serde(default)]
+    network: String,
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    device_key: String,
+    #[serde(default)]
+    issued_by: String,
+    #[serde(default = "go_zero_time", with = "rfc3339_unix::time")]
+    issued_at: GoTime,
+    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
+    expires_at: Expiry,
+    #[serde(default)]
+    signature: String,
 }
 
 /// Go's field names (`json` tags) of an ovlast.
@@ -294,9 +348,58 @@ pub(crate) const OVLAST_SCHEMA: Schema = Schema {
     ],
     baseline: &[],
 };
-go_struct!(Ovlast, OVLAST_SCHEMA);
+go_struct!(OvlastWire, OVLAST_SCHEMA);
 
-fn go_zero_time() -> i64 {
+impl From<OvlastWire> for Ovlast {
+    fn from(w: OvlastWire) -> Self {
+        Self {
+            network: w.network,
+            device_id: w.device_id,
+            device_key: w.device_key,
+            issued_by: w.issued_by,
+            issued_at: w.issued_at.unix,
+            issued_at_nanos: w.issued_at.nanos,
+            expires_at: w.expires_at,
+            signature: w.signature,
+        }
+    }
+}
+
+impl From<&Ovlast> for OvlastWire {
+    fn from(o: &Ovlast) -> Self {
+        Self {
+            network: o.network.clone(),
+            device_id: o.device_id.clone(),
+            device_key: o.device_key.clone(),
+            issued_by: o.issued_by.clone(),
+            issued_at: o.issued_at(),
+            expires_at: o.expires_at,
+            signature: o.signature.clone(),
+        }
+    }
+}
+
+impl Serialize for Ovlast {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        <OvlastWire as Serialize>::serialize(&OvlastWire::from(self), s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ovlast {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The trait's reader (Go's rules), not the derive's own `OvlastWire::deserialize`.
+        <OvlastWire as Deserialize>::deserialize(d).map(Self::from)
+    }
+}
+
+fn go_zero_time() -> GoTime {
+    GoTime {
+        unix: GO_ZERO_TIME_UNIX,
+        nanos: 0,
+    }
+}
+
+fn go_zero_unix() -> i64 {
     GO_ZERO_TIME_UNIX
 }
 
@@ -329,42 +432,71 @@ impl Ovlast {
         .expect("canonical ovlast serializes")
     }
 
+    /// Whether the ovlast holds at `at_unix`, a whole second. The ovlast's own times are
+    /// compared in full, as Go compares them: one issued at `at_unix` and a half does not
+    /// hold yet at `at_unix`.
     pub fn verify(&self, network_pub: &VerifyingKey, at_unix: i64) -> Result<(), TrustError> {
+        self.verify_at(network_pub, (at_unix, 0))
+    }
+
+    fn verify_at(&self, network_pub: &VerifyingKey, at: Instant) -> Result<(), TrustError> {
         if self.network != public_key_to_base64(network_pub.as_bytes()) {
             return Err(TrustError::OtherNetwork);
         }
         verify_ed25519_b64(network_pub, &self.signed_bytes(), &self.signature)?;
-        if at_unix < self.issued_at {
+        if at < (self.issued_at, self.issued_at_nanos) {
             return Err(TrustError::NotYetValid);
         }
-        if self.expires_at.is_expired_at(at_unix) {
+        if self.expires_at.passed_at(at) {
             return Err(TrustError::Expired);
         }
         Ok(())
+    }
+
+    fn issued_at(&self) -> GoTime {
+        GoTime {
+            unix: self.issued_at,
+            nanos: self.issued_at_nanos,
+        }
     }
 }
 
 /// Read as Go reads it, as [`Ovlast`] is. The admitter's ovlast is read only under Go's
 /// name `primatelj`; objects given for it more than once add up, and `null` clears it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
-    #[serde(default)]
     pub network: String,
-    #[serde(default)]
     pub device_id: String,
-    #[serde(default)]
     pub device_key: String,
-    #[serde(default)]
     pub issued_by: String,
-    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
+    /// The part of a second past `issued_at`, as in [`Ovlast::issued_at_nanos`].
+    pub issued_at_nanos: u32,
     pub expires_at: Expiry,
-    #[serde(default)]
     pub signature: String,
-    #[serde(rename = "primatelj", default, skip_serializing_if = "Option::is_none")]
     pub admitter: Option<Ovlast>,
+}
+
+/// A membership as the wire carries it, its times in full.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Self", rename_all = "camelCase")]
+struct MembershipWire {
+    #[serde(default)]
+    network: String,
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    device_key: String,
+    #[serde(default)]
+    issued_by: String,
+    #[serde(default = "go_zero_time", with = "rfc3339_unix::time")]
+    issued_at: GoTime,
+    #[serde(default = "no_expiry", with = "rfc3339_unix::expiry")]
+    expires_at: Expiry,
+    #[serde(default)]
+    signature: String,
+    #[serde(rename = "primatelj", default, skip_serializing_if = "Option::is_none")]
+    admitter: Option<Ovlast>,
 }
 
 /// Go's field names (`json` tags) of a membership.
@@ -381,7 +513,54 @@ pub(crate) const MEMBERSHIP_SCHEMA: Schema = Schema {
     ],
     baseline: &[],
 };
-go_struct!(Membership, MEMBERSHIP_SCHEMA);
+go_struct!(MembershipWire, MEMBERSHIP_SCHEMA);
+
+impl From<MembershipWire> for Membership {
+    fn from(w: MembershipWire) -> Self {
+        Self {
+            network: w.network,
+            device_id: w.device_id,
+            device_key: w.device_key,
+            issued_by: w.issued_by,
+            issued_at: w.issued_at.unix,
+            issued_at_nanos: w.issued_at.nanos,
+            expires_at: w.expires_at,
+            signature: w.signature,
+            admitter: w.admitter,
+        }
+    }
+}
+
+impl From<&Membership> for MembershipWire {
+    fn from(m: &Membership) -> Self {
+        Self {
+            network: m.network.clone(),
+            device_id: m.device_id.clone(),
+            device_key: m.device_key.clone(),
+            issued_by: m.issued_by.clone(),
+            issued_at: GoTime {
+                unix: m.issued_at,
+                nanos: m.issued_at_nanos,
+            },
+            expires_at: m.expires_at,
+            signature: m.signature.clone(),
+            admitter: m.admitter.clone(),
+        }
+    }
+}
+
+impl Serialize for Membership {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        <MembershipWire as Serialize>::serialize(&MembershipWire::from(self), s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Membership {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The trait's reader (Go's rules), not the derive's own `MembershipWire::deserialize`.
+        <MembershipWire as Deserialize>::deserialize(d).map(Self::from)
+    }
+}
 
 impl Membership {
     pub fn signed_bytes(&self) -> Vec<u8> {
@@ -446,14 +625,15 @@ impl Membership {
         if admitter_pub_b64 != ovlast.device_key {
             return Err(TrustError::UnauthorizedSigner);
         }
-        if issued_at < ovlast.issued_at || ovlast.expires_at.is_expired_at(issued_at) {
+        // As Go: the ovlast's own times count in full, the membership's are whole seconds.
+        if (issued_at, 0) < (ovlast.issued_at, ovlast.issued_at_nanos)
+            || ovlast.expires_at.is_expired_at(issued_at)
+        {
             return Err(TrustError::Expired);
         }
         let mut exp = validity.expires_at()?;
-        if let Some(limit) = ovlast.expires_at.last_second()
-            && exp.last_second().is_none_or(|last| last > limit)
-        {
-            exp = Expiry::from_wire_unix(limit);
+        if exp.runs_longer_than(ovlast.expires_at) {
+            exp = ovlast.expires_at;
         }
         let issued_by = ovlast.device_id.clone();
         let mut m = Self {
@@ -462,6 +642,7 @@ impl Membership {
             device_key: public_key_to_base64(device_key.as_bytes()),
             issued_by,
             issued_at,
+            issued_at_nanos: 0,
             expires_at: exp,
             signature: String::new(),
             admitter: Some(ovlast),
@@ -483,11 +664,11 @@ impl Membership {
         if self.device_key != public_key_to_base64(device_key.as_bytes()) {
             return Err(TrustError::KeyMismatch);
         }
-        let signer = verify_admitter_chain(
+        let signer = admitter_chain(
             network_pub,
             self.admitter.as_ref(),
             &self.issued_by,
-            self.issued_at,
+            (self.issued_at, self.issued_at_nanos),
             self.expires_at,
             now_unix,
         )?;
@@ -514,9 +695,9 @@ pub struct Revocation {
     pub target_id: String,
     #[serde(default)]
     pub public_key: String,
-    #[serde(default = "go_zero_time", with = "rfc3339_unix")]
+    #[serde(default = "go_zero_unix", with = "rfc3339_unix")]
     pub issued_at: i64,
-    #[serde(rename = "opozvanoAt", default = "go_zero_time", with = "rfc3339_unix")]
+    #[serde(rename = "opozvanoAt", default = "go_zero_unix", with = "rfc3339_unix")]
     pub revoked_at: i64,
     #[serde(rename = "opozvao", default)]
     pub revoked_by: String,
@@ -740,6 +921,9 @@ impl SignedVersionEnvelope {
 /// no expiry). A record where 0 means no expiry must pass [`Expiry::NEVER`] for its 0:
 /// read as a wire number, 0 is 1970, earlier than any ovlast's limit, and the record
 /// would pass here and then never expire.
+///
+/// `issued_at` is a whole second. The times of the ovlast and `expires_at` are compared
+/// in full, as Go compares them ([`Expiry`]).
 pub fn verify_admitter_chain(
     network_pub: &VerifyingKey,
     admitter: Option<&Ovlast>,
@@ -748,18 +932,34 @@ pub fn verify_admitter_chain(
     expires_at: Expiry,
     now_unix: i64,
 ) -> Result<VerifyingKey, TrustError> {
+    admitter_chain(
+        network_pub,
+        admitter,
+        issued_by,
+        (issued_at, 0),
+        expires_at,
+        now_unix,
+    )
+}
+
+fn admitter_chain(
+    network_pub: &VerifyingKey,
+    admitter: Option<&Ovlast>,
+    issued_by: &str,
+    issued_at: Instant,
+    expires_at: Expiry,
+    now_unix: i64,
+) -> Result<VerifyingKey, TrustError> {
     let Some(ovlast) = admitter else {
         return Ok(*network_pub);
     };
     ovlast
-        .verify(network_pub, issued_at)
+        .verify_at(network_pub, issued_at)
         .map_err(|e| TrustError::AdmitterOvlast(Box::new(e)))?;
-    if let Some(limit) = ovlast.expires_at.last_second()
-        && expires_at.last_second().is_none_or(|last| last > limit)
-    {
+    if expires_at.runs_longer_than(ovlast.expires_at) {
         return Err(TrustError::ExceedsAdmitterAuthority);
     }
-    if issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
+    if issued_at > (now_unix.saturating_add(MAX_CLOCK_SKEW_SECS), 0) {
         return Err(TrustError::IssuedInFuture);
     }
     if ovlast.device_id != issued_by {
@@ -806,6 +1006,21 @@ pub mod rfc3339_unix {
         format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
     }
 
+    /// A time as Go writes one (`time.RFC3339Nano` in UTC): the part of a second with
+    /// the trailing zeros left out, and none at all for a whole second.
+    pub fn format_utc_nanos(unix: i64, nanos: u32) -> String {
+        let whole = format_utc(unix);
+        if nanos == 0 {
+            return whole;
+        }
+        let fraction = format!("{nanos:09}");
+        format!(
+            "{}.{}Z",
+            &whole[..whole.len() - 1],
+            fraction.trim_end_matches('0')
+        )
+    }
+
     /// Unix seconds (rounded down) of a time as Go reads one ([`go_time::parse`]).
     pub fn parse_utc(s: &str) -> Result<i64, String> {
         go_time::parse(s.as_bytes())
@@ -818,8 +1033,9 @@ pub mod rfc3339_unix {
     }
 
     /// An [`Expiry`](super::Expiry) as the wire writes it: a time, Go's zero time for no
-    /// expiry. It reads what [`rfc3339_unix::deserialize`](deserialize) reads, and
-    /// takes the seconds as [`Expiry::from_wire_unix`](super::Expiry::from_wire_unix) does.
+    /// expiry. It reads what [`rfc3339_unix::deserialize`](deserialize) reads, takes the
+    /// seconds as [`Expiry::from_wire_unix`](super::Expiry::from_wire_unix) does, and keeps
+    /// the part of a second, which it also writes back as Go does.
     ///
     /// Go's zero time with a part of a second (`0001-01-01T00:00:00.5Z`) is refused as a
     /// bad record. Go takes it as an expiry in year 1, so as long past for any check after
@@ -833,7 +1049,7 @@ pub mod rfc3339_unix {
         use serde::{Deserializer, Serializer, de};
 
         pub fn serialize<S: Serializer>(expiry: &Expiry, ser: S) -> Result<S::Ok, S::Error> {
-            super::serialize(&expiry.wire_unix(), ser)
+            ser.serialize_str(&super::format_utc_nanos(expiry.wire_unix(), expiry.nanos()))
         }
 
         pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Expiry, D::Error> {
@@ -847,9 +1063,27 @@ pub mod rfc3339_unix {
                         "expiresAt: nulto vrijeme s dijelom sekunde",
                     ))
                 }
-                Some(t) => Ok(Expiry::from_wire_unix(t.unix)),
+                Some(t) => Ok(Expiry::from_go_time(t)),
                 None => Ok(Expiry::NEVER),
             }
+        }
+    }
+
+    /// A time with its part of a second, read and written as Go does: `null` is Go's
+    /// zero time.
+    pub(crate) mod time {
+        use crate::wire::go_time::GoTime;
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(t: &GoTime, ser: S) -> Result<S::Ok, S::Error> {
+            ser.serialize_str(&super::format_utc_nanos(t.unix, t.nanos))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<GoTime, D::Error> {
+            Ok(super::read(de)?.unwrap_or(GoTime {
+                unix: super::super::GO_ZERO_TIME_UNIX,
+                nanos: 0,
+            }))
         }
     }
 
@@ -1390,6 +1624,7 @@ mod tests {
                 device_key: edge.key.clone(),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
+                issued_at_nanos: 0,
                 expires_at: Expiry::from_wire_unix(AT + 48 * 3600),
                 signature: String::new(),
             };
@@ -1400,6 +1635,7 @@ mod tests {
                 device_key: b64(&member().verifying_key()),
                 issued_by: "primatelj-1".into(),
                 issued_at: AT,
+                issued_at_nanos: 0,
                 expires_at: Expiry::from_wire_unix(AT + 24 * 3600),
                 signature: String::new(),
                 admitter: Some(ovlast),
@@ -1753,6 +1989,7 @@ mod tests {
                 device_key: b64(&member().verifying_key()),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
+                issued_at_nanos: 0,
                 expires_at: Expiry::from_wire_unix(AT + 24 * 3600),
                 signature: String::new(),
                 admitter: None,
@@ -1780,6 +2017,7 @@ mod tests {
                 device_key: b64(&signer().verifying_key()),
                 issued_by: "admin-1".into(),
                 issued_at: AT,
+                issued_at_nanos: 0,
                 expires_at: Expiry::from_wire_unix(AT + 48 * 3600),
                 signature: String::new(),
             };
@@ -2158,6 +2396,7 @@ mod tests {
                     device_key: b64(&admitter),
                     issued_by: "admin".into(),
                     issued_at: c.o_issued.unwrap_or(AT - DAY),
+                    issued_at_nanos: 0,
                     expires_at: Expiry::from_wire_unix(c.o_expires.unwrap_or(AT + 2 * DAY)),
                     signature: String::new(),
                 };
@@ -2173,6 +2412,7 @@ mod tests {
                     .unwrap_or(if c.admitter { "primatelj-1" } else { "root" })
                     .into(),
                 issued_at: c.m_issued.unwrap_or(AT),
+                issued_at_nanos: 0,
                 expires_at: Expiry::from_wire_unix(c.m_expires.unwrap_or(AT + DAY)),
                 signature: String::new(),
                 admitter: ovlast,
@@ -2379,6 +2619,7 @@ mod tests {
                 device_key: b64(&key(7)),
                 issued_by: "admin".into(),
                 issued_at: AT - DAY,
+                issued_at_nanos: 0,
                 expires_at,
                 signature: String::new(),
             };
@@ -2401,6 +2642,7 @@ mod tests {
                 }
                 .into(),
                 issued_at: AT,
+                issued_at_nanos: 0,
                 expires_at,
                 signature: String::new(),
                 admitter,
@@ -2988,6 +3230,7 @@ mod records_as_in_go {
             device_key: public_key_to_base64(device.as_bytes()),
             issued_by: "root".into(),
             issued_at: 1_760_000_000,
+            issued_at_nanos: 0,
             expires_at: Expiry::NEVER,
             signature: String::new(),
             admitter: None,
@@ -3032,6 +3275,248 @@ mod records_as_in_go {
             };
             let rust = if go == "istekao" { "GRESKA" } else { go };
             assert_eq!(got, rust, "{from} -> {to}");
+        }
+    }
+
+    /// Times with a part of a second, in an ovlast and a membership signed for real (keys
+    /// from seeds 1, 2 and 3, as in the Go probe), written, read back and checked. The
+    /// part of a second is not signed, but Go keeps it and compares the records' times in
+    /// full; the clock (`now`) is a whole second on both sides. Go column: Go's
+    /// `json.Marshal`, `json.Unmarshal` and check, go1.27.1. Before, Rust read whole
+    /// seconds and took rows Go turns away (`dulje`, `ne vrijedi`, `buducnost`).
+    #[test]
+    fn fractions_of_a_second_as_in_go() {
+        const I: i64 = 1_760_000_000;
+        type T = (i64, u32);
+        const ZERO: T = (GO_ZERO_TIME_UNIX, 0);
+        let (net, adm, mem) = (key(1), key(2), key(3));
+        let net_pub = net.verifying_key();
+        let ovlast = |iss: T, exp: T| {
+            let mut o = Ovlast {
+                network: public_key_to_base64(net_pub.as_bytes()),
+                device_id: "prim".into(),
+                device_key: public_key_to_base64(adm.verifying_key().as_bytes()),
+                issued_by: "root".into(),
+                issued_at: iss.0,
+                issued_at_nanos: iss.1,
+                expires_at: Expiry::from_go_time(GoTime {
+                    unix: exp.0,
+                    nanos: exp.1,
+                }),
+                signature: String::new(),
+            };
+            o.signature = STANDARD.encode(net.sign(&o.signed_bytes()).to_bytes());
+            o
+        };
+        let outcome = |r: Result<(), TrustError>| match r {
+            Ok(()) => "ok",
+            Err(TrustError::ExceedsAdmitterAuthority) => "dulje",
+            Err(TrustError::AdmitterOvlast(_)) => "ne vrijedi",
+            Err(TrustError::IssuedInFuture) => "buducnost",
+            Err(TrustError::Expired) => "istekao",
+            Err(e) => panic!("{e:?}"),
+        };
+
+        // (ovlast issuedAt, expiresAt, membership issuedAt, expiresAt, now, Go)
+        let rows: &[(T, T, T, T, i64, &str)] = &[
+            (
+                (I, 0),
+                (I + 86400, 0),
+                (I + 100, 0),
+                (I + 3600, 0),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 200_000_000),
+                (I + 100, 0),
+                (I + 86400, 700_000_000),
+                I + 200,
+                "dulje",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 500_000_000),
+                (I + 100, 0),
+                (I + 86400, 500_000_000),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 700_000_000),
+                (I + 100, 0),
+                (I + 86400, 200_000_000),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86401, 0),
+                (I + 100, 0),
+                (I + 86400, 999_999_999),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 1),
+                (I + 100, 0),
+                (I + 86400, 0),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I + 100, 700_000_000),
+                (I + 86400, 0),
+                (I + 100, 200_000_000),
+                (I + 3600, 0),
+                I + 200,
+                "ne vrijedi",
+            ),
+            (
+                (I + 100, 700_000_000),
+                (I + 86400, 0),
+                (I + 100, 700_000_000),
+                (I + 3600, 0),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I + 100, 200_000_000),
+                (I + 86400, 0),
+                (I + 100, 700_000_000),
+                (I + 3600, 0),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 100, 200_000_000),
+                (I + 100, 700_000_000),
+                (I + 100, 0),
+                I + 200,
+                "ne vrijedi",
+            ),
+            (
+                (I, 0),
+                (I + 100, 300_000_000),
+                (I + 100, 300_000_000),
+                (I + 100, 0),
+                I + 200,
+                "istekao",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 0),
+                (I + 100, 500_000_000),
+                (I + 3600, 0),
+                I + 100 - 3600,
+                "buducnost",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 0),
+                (I + 100, 0),
+                (I + 3600, 0),
+                I + 100 - 3600,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 0),
+                (I + 100, 0),
+                (I + 3600, 500_000_000),
+                I + 3600,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 0),
+                (I + 100, 0),
+                (I + 3600, 500_000_000),
+                I + 3601,
+                "istekao",
+            ),
+            (
+                (I, 0),
+                ZERO,
+                (I + 100, 0),
+                (I + 3600, 500_000_000),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I, 0),
+                (I + 86400, 500_000_000),
+                (I + 100, 0),
+                ZERO,
+                I + 200,
+                "dulje",
+            ),
+            (
+                (I, 100_000_000),
+                (I + 86400, 900_000_000),
+                (I + 100, 400_000_000),
+                (I + 86400, 800_000_000),
+                I + 200,
+                "ok",
+            ),
+            (
+                (I + 100, 0),
+                (I + 86400, 0),
+                (I + 100, 1),
+                (I + 3600, 0),
+                I + 200,
+                "ok",
+            ),
+        ];
+        for (n, &(o_iss, o_exp, m_iss, m_exp, now, go)) in rows.iter().enumerate() {
+            let mut m = Membership {
+                network: public_key_to_base64(net_pub.as_bytes()),
+                device_id: "clan".into(),
+                device_key: public_key_to_base64(mem.verifying_key().as_bytes()),
+                issued_by: "prim".into(),
+                issued_at: m_iss.0,
+                issued_at_nanos: m_iss.1,
+                expires_at: Expiry::from_go_time(GoTime {
+                    unix: m_exp.0,
+                    nanos: m_exp.1,
+                }),
+                signature: String::new(),
+                admitter: Some(ovlast(o_iss, o_exp)),
+            };
+            m.signature = STANDARD.encode(adm.sign(&m.signed_bytes()).to_bytes());
+            let text = serde_json::to_string(&m).unwrap();
+            let back: Membership = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, m, "row {n}");
+            let got = outcome(back.verify(&net_pub, &mem.verifying_key(), now));
+            assert_eq!(got, go, "row {n}: {text}");
+            if n == 17 {
+                assert_eq!(
+                    text,
+                    r#"{"network":"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=","deviceId":"clan","deviceKey":"7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=","issuedBy":"prim","issuedAt":"2025-10-09T08:55:00.4Z","expiresAt":"2025-10-10T08:53:20.8Z","signature":"v1cRfRV7OT7mjemaAYYYQDmtTYzO/ZSLHFRug1RIUnfKwdKEOV7d/o/sbODSvMOo51MybRuA3o+0JFvwv49QBQ==","primatelj":{"network":"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=","deviceId":"prim","deviceKey":"gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=","issuedBy":"root","issuedAt":"2025-10-09T08:53:20.1Z","expiresAt":"2025-10-10T08:53:20.9Z","signature":"P6Rzbs0Mfc1x+o0PfCwIrllhEXqIPYHLir63RVNixuNlqZAr9HA57S8M1HQLy7ieelS20juKpHiLF7UigpE/Bg=="}}"#,
+                    "the text Go writes"
+                );
+            }
+        }
+
+        // The ovlast alone, checked at a whole second (Go column the same way).
+        for (iss, exp, at, go) in [
+            ((I, 500_000_000), (I + 86400, 0), I, "ne vrijedi"),
+            ((I, 0), (I + 86400, 0), I, "ok"),
+            ((I, 0), (I + 86400, 500_000_000), I + 86400, "ok"),
+            ((I, 0), (I + 86400, 500_000_000), I + 86401, "ne vrijedi"),
+        ] {
+            let o: Ovlast =
+                serde_json::from_str(&serde_json::to_string(&ovlast(iss, exp)).unwrap()).unwrap();
+            let got = match o.verify(&net_pub, at) {
+                Ok(()) => "ok",
+                Err(TrustError::NotYetValid | TrustError::Expired) => "ne vrijedi",
+                Err(e) => panic!("{e:?}"),
+            };
+            assert_eq!(got, go, "{iss:?} {exp:?} {at}");
         }
     }
 }
