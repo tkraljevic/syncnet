@@ -33,9 +33,11 @@ dobiti druge bajtove svuda gdje ime ili oznaka ulaze u izračun.
 
 Imena računala (`admin-1`, `racunalo-b`), zapis (`biljeske`) i kanal
 (`primjer/7/2026`) su izmišljeni. Izmišljena je i osoba u vektoru potpisa
-verzije. Vrste zapisa `users` i `readings` u tom vektoru i kanal
-`ocitanja/16/2026` imena su iz programa u kojem je protokol nastao; druga
-aplikacija ima svoja.
+verzije. Neka imena u vektorima potpisa verzije preuzeta su iz programa u
+kojem je protokol nastao: vrste zapisa `users` i `readings`, zapis
+`ocitanje-1`, kanal `ocitanja/16/2026` i polje `cm` u sadržaju. Druga
+aplikacija ima svoja. Vektori dodani 28. 11. 2026. imaju neutralna imena
+(`stavke`, `stavka-2`, `kanal` uz U+2028, polja `a` i `b`).
 
 Primanje na daljinu ima još dva stalna ulaza: sol od 16 bajtova `0xCC` i
 kod `7KQ4-M2XD`.
@@ -92,8 +94,15 @@ kod `7KQ4-M2XD`.
   dopune i s viškom dopune, s viškom bitova u zadnjem znaku, u abecedi za
   URL, prekratke i predugačke. Uz to ključ potpisan nad drugim zapisom
   istih bajtova (redovi `_stari_potpis`), ključ od 32 bajta koji nije
-  točka krivulje, točku identiteta u tri zapisa, potpis s nesvedenim `s`
-  (`s + L`) i potpis s postavljenim najvišim bitom.
+  točka krivulje, točku identiteta u tri zapisa, točku reda 2 kao ključ,
+  potpis s nesvedenim `s` (`s + L`), potpis čiji je `R` identitet zapisan
+  nekanonski (kao y + p) i potpis s postavljenim najvišim bitom.
+
+  Go provjerava Ed25519 bez kofaktora, traži `s < L` i `R` uspoređuje po
+  bajtovima. Zato je nekanonski `R` kriv, a ključ reda 2 uz `R` =
+  identitet i `s = 0` daje `kriv`. Provjera s kofaktorom za isti redak dala
+  bi `vrijedi`. Ishod tog retka ovisi o poruci, pa uz drugo ime protokola
+  može biti drukčiji.
 
 ## vektori-razgovora.json
 
@@ -154,4 +163,5 @@ Kod potpisa verzije vektori pokazuju bajtove i ishod same provjere
 potpisa. Ne pokrivaju potpisan redak paketa ni odluke primatelja koje
 ovise o knjizi i članstvima: ključ koji nije vezan uz `node_id`, članstvo
 koje stiže u istoj delti, strože pravilo za nepotpisanu verziju od
-računala s oznakom `potpis-verzije/1` i dopunu.
+računala s oznakom `potpis-verzije/1` i dopunu. Nema ni vektora za
+sadržaj s ponovljenim ključem.
